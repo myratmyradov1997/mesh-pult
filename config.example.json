@@ -1,0 +1,6 @@
+{
+  "python":  "/Users/USERNAME/.meshpult/venv/bin/python",
+  "bridge":  "/Users/USERNAME/mesh-pult/mesh_remote.py",
+  "notchWidth": 220,
+  "panelWidth": 400
+}
