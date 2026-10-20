@@ -6,3 +6,4 @@ MeshPultMenubar
 main_dbg*.swift
 main_debug*.swift
 *.log
+__pycache__/
