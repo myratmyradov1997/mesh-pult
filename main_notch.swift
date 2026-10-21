@@ -463,6 +463,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Блик «liquid glass»: полупрозрачный градиент из верхнего левого угла
+final class GlassSheenView: NSView {
+    override func makeBackingLayer() -> CALayer {
+        let g = CAGradientLayer()
+        g.colors = [
+            NSColor.white.withAlphaComponent(0.22).cgColor,
+            NSColor.white.withAlphaComponent(0.08).cgColor,
+            NSColor.white.withAlphaComponent(0.0).cgColor
+        ]
+        g.locations = [0, 0.28, 0.75]
+        g.startPoint = CGPoint(x: 0, y: 1)
+        g.endPoint = CGPoint(x: 1, y: 0)
+        return g
+    }
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }  // клики сквозь блик
+}
+
 /// Вид-ловушка: прозрачный, ловит наведение/клик на чёлке
 final class LureView: NSView {
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
@@ -478,10 +496,12 @@ final class LureView: NSView {
     override func mouseDown(with event: NSEvent) { app?.showPanel() }
     override func mouseExited(with event: NSEvent) { app?.hideSoon() }
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill()
-        bounds.fill()
+        // ловушка невидима: чёлку рисует сама macOS (скруглённая),
+        // а мы лишь ловим мышь поверх неё — иначе чёлка выглядит «прямоугольной»
+        NSColor.clear.setFill()
+        dirtyRect.fill()
     }
-    override var isOpaque: Bool { true }
+    override var isOpaque: Bool { false }
 }
 
 var app: AppDelegate?
@@ -527,10 +547,29 @@ final class PanelView: NSView {
 
     func commonInit() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.07, alpha: 1).cgColor
+        // «liquid glass»: тонкая тёмная подложка + размытие под панелью
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 0.30).cgColor
         layer?.cornerRadius = 20
-        // маска скругления только нижних углов делается визуально чёрной шапкой ниже
+        layer?.masksToBounds = true
+        layer?.borderWidth = 0.6
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
 
+        // размытие всего, что за панелью
+        let blur = NSVisualEffectView(frame: bounds)
+        blur.autoresizingMask = [.width, .height]
+        blur.material = .underWindowBackground
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.appearance = NSAppearance(named: .darkAqua)
+        blur.wantsLayer = true
+        blur.layer?.cornerRadius = 20
+        blur.layer?.masksToBounds = true
+        addSubview(blur, positioned: .below, relativeTo: nil)
+
+        // блик стекла: мягкий градиент из левого верхнего угла
+        let sheen = GlassSheenView(frame: bounds)
+        sheen.autoresizingMask = [.width, .height]
+        addSubview(sheen, positioned: .below, relativeTo: nil)
         let vstack = NSStackView()
         vstack.orientation = .vertical
         vstack.spacing = 8
@@ -604,8 +643,15 @@ final class PanelView: NSView {
         let b = NSButton(title: s, target: app, action: action)
         b.bezelStyle = .rounded
         b.controlSize = .small
-        b.font = NSFont.systemFont(ofSize: 11)
+        let font = NSFont.systemFont(ofSize: 11)
+        b.font = font
+        // текст кнопок на тёмном стекле — белый, иначе системный labelColor сливается
+        b.attributedTitle = NSAttributedString(string: s, attributes: [.foregroundColor: NSColor.white, .font: font])
         b.wantsLayer = true
+        b.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        b.layer?.cornerRadius = 8
+        b.layer?.borderWidth = 0.5
+        b.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
         return b
     }
 
@@ -696,15 +742,22 @@ final class PanelView: NSView {
         let sp = NSView(); sp.widthAnchor.constraint(equalToConstant: 14).isActive = true
         row.addArrangedSubview(sp)
         for (k, ls) in block.enumerated() {
-            let b = TagButton(title: "\(k + 1)-й (\(ls.begin ?? ""))", target: app, action: #selector(AppDelegate.doChooseLesson(_:)))
+            let title = "\(k + 1)-й (\(ls.begin ?? ""))"
+            let b = TagButton(title: title, target: app, action: #selector(AppDelegate.doChooseLesson(_:)))
             b.bezelStyle = .inline
             b.controlSize = .small
-            b.font = NSFont.systemFont(ofSize: 10)
+            let bf = NSFont.systemFont(ofSize: 10, weight: .medium)
+            b.font = bf
+            b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.white, .font: bf])
             b.payload = ["kind": "choose", "blockKey": key, "lessonIdx": i_of(block, ls)]
             b.wantsLayer = true
-            b.layer?.cornerRadius = 4
+            b.layer?.cornerRadius = 6
+            b.layer?.borderWidth = 0.5
+            b.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
             if k == activeIdx {
                 b.layer?.backgroundColor = NSColor.systemTeal.withAlphaComponent(0.35).cgColor
+            } else {
+                b.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
             }
             row.addArrangedSubview(b)
         }
@@ -763,12 +816,18 @@ final class PanelView: NSView {
                     : ["kind": "mark", "student": id, "grade": g, "name": name, "lessonId": activeLesson.scheduleLessonId ?? 0]
                 if blockKey != nil { rep["blockKey"] = blockKey }
                 let b = TagButton(title: g == 0 ? "Н" : String(g), target: app, action: #selector(AppDelegate.doGrade(_:)))
+                let bf = NSFont.systemFont(ofSize: 10, weight: .medium)
                 b.bezelStyle = .inline
                 b.controlSize = .small
-                b.font = NSFont.systemFont(ofSize: 10)
+                b.font = bf
+                b.attributedTitle = NSAttributedString(
+                    string: g == 0 ? "Н" : String(g),
+                    attributes: [.foregroundColor: NSColor.white, .font: bf])
                 b.payload = rep
                 b.wantsLayer = true
-                b.layer?.cornerRadius = 4
+                b.layer?.cornerRadius = 6
+                b.layer?.borderWidth = 0.5
+                b.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
                 if g != 0 {
                     for (k, ls) in block.enumerated() {
                         guard let lid = ls.scheduleLessonId,
@@ -799,25 +858,31 @@ final class PanelView: NSView {
     }
 
 private func blockButton(_ title: String, key: String, width: CGFloat) -> LessonRowButton {
-        let b = LessonRowButton(title: title, target: app, action: #selector(AppDelegate.pickBlock(_:)))
-        b.blockKey = key
-        b.bezelStyle = .recessed
-        b.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        b.wantsLayer = true
-        b.layer?.cornerRadius = 6
-        b.setButtonType(.momentaryPushIn)
-        b.widthAnchor.constraint(equalToConstant: width).isActive = true
-        b.alignment = .left
-        return b
-    }
+    let b = LessonRowButton(title: title, target: app, action: #selector(AppDelegate.pickBlock(_:)))
+    b.blockKey = key
+    b.bezelStyle = .recessed
+    let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+    b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.white, .font: font])
+    b.wantsLayer = true
+    b.layer?.cornerRadius = 6
+    b.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
+    b.setButtonType(.momentaryPushIn)
+    b.widthAnchor.constraint(equalToConstant: width).isActive = true
+    b.alignment = .left
+    return b
+}
 
     private func rowButton(_ title: String, action: Selector, index: Int, width: CGFloat) -> LessonRowButton {
         let b = LessonRowButton(title: title, target: app, action: action)
         b.lessonIndex = index
         b.bezelStyle = .recessed
-        b.font = NSFont.systemFont(ofSize: 12)
+        let font = NSFont.systemFont(ofSize: 12)
+        b.font = font
+        // на тёмной панели текст не должен уезжать в системный labelColor (чёрный)
+        b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.white, .font: font])
         b.wantsLayer = true
         b.layer?.cornerRadius = 6
+        b.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
         b.imageScaling = .scaleNone
         b.setButtonType(.momentaryPushIn)
         b.widthAnchor.constraint(equalToConstant: width).isActive = true
