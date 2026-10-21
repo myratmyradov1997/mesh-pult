@@ -5,12 +5,17 @@
   today                      — уроки учителя на сегодня (+ is_current)
   students --group-id N      — ученики группы
   status                     — токен (до когда), профиль
+  grades [--schedule-lesson-id N]                — оценки и Н урока (с id записей)
   act mark --student-id N --grade 5 [--dry]      — оценка на ТЕКУЩЕМ уроке
   act absence --student-id N [--dry]             — Н на текущем уроке
+  act absence --student-ids 1,2,3                 — Н нескольким ученикам (перекличка)
   act nohomework [--dry]                          — «без д/з» на текущем уроке
+  delete mark --ids 1,2                           — удалить оценки по id
+  delete absence --ids 1,2                        — удалить Н по id
 
 Всё переиспользует mesh_automation_v3 (единый источник: токен-цепочка,
-параметры урока, API).
+параметры урока, API). Функции *_data(...) возвращают dict и годятся для
+прямого импорта (кроссплатформенный GUI); cmd_* — CLI-обёртки над ними.
 """
 import os
 import sys
@@ -36,7 +41,7 @@ def die(msg: str) -> int:
 
 
 # «настоящий» stdout: всё, что печатают библиотеки, уйдёт в stderr
-REAL_OUT = os.fdopen(os.dup(1), "w", encoding="utf-8", newline="\n")
+REAL_OUT = sys.stdout
 
 
 def fresh_mesh():
@@ -80,14 +85,13 @@ def lesson_public(l: dict) -> dict:
     }
 
 
-def cmd_today() -> int:
-    m, mesh = fresh_mesh()
-    lessons = mesh.get_daily_schedule()
-    return out({"lessons": [lesson_public(l) for l in lessons]})
+# ---------- данные (dict) ----------
+
+def today_data(mesh) -> dict:
+    return {"lessons": [lesson_public(l) for l in mesh.get_daily_schedule()]}
 
 
-def cmd_students(group_id: int) -> int:
-    m, mesh = fresh_mesh()
+def students_data(mesh, group_id: int) -> dict:
     profiles = mesh.get_student_profiles(group_id)
     students = [
         {"id": p.get("id"),
@@ -95,41 +99,25 @@ def cmd_students(group_id: int) -> int:
         for p in profiles
     ]
     students.sort(key=lambda s: s["name"])
-    return out({"students": students})
+    return {"students": students}
 
 
-def cmd_status() -> int:
+def token_expires(mesh):
     from datetime import datetime
-    m, mesh = fresh_mesh()
     tok = (mesh.session.headers.get("Authorization") or "").replace("Bearer ", "")
-    exp = None
     try:
         payload = tok.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
+        payload += "=" * (-len(payload) % 4)
         data = json.loads(base64.urlsafe_b64decode(payload))
         if data.get("exp"):
-            exp = datetime.fromtimestamp(data["exp"]).strftime("%Y-%m-%d %H:%M")
+            return datetime.fromtimestamp(data["exp"]).strftime("%Y-%m-%d %H:%M")
     except Exception:
         pass
-    return out({"profile_id": mesh.profile_id, "token_expires": exp})
+    return None
 
 
-def cmd_grades(schedule_lesson_id=None) -> int:
-    m, mesh = fresh_mesh()
-    lesson = resolve_current(mesh, schedule_lesson_id)
-    marks = mesh.get_marks(lesson["schedule_lesson_id"])
-    by_student: dict = {}
-    for x in marks:
-        if not isinstance(x, dict):
-            continue
-        if x.get("deleted_by") is not None:
-            continue
-        sid = x.get("student_profile_id")
-        if not sid:
-            continue
-        name = str(x.get("name") or "?")
-        by_student.setdefault(sid, []).append(name)
-    return out({"lesson": lesson_public(lesson), "grades": by_student})
+def status_data(mesh) -> dict:
+    return {"profile_id": mesh.profile_id, "token_expires": token_expires(mesh)}
 
 
 def resolve_current(mesh, schedule_lesson_id=None, group_id=None):
@@ -145,12 +133,59 @@ def resolve_current(mesh, schedule_lesson_id=None, group_id=None):
     return cur
 
 
-def cmd_act(kind: str, student_id=None, grade=None, dry: bool = False,
-            schedule_lesson_id=None, group_id=None) -> int:
+def lesson_marks(mesh, schedule_lesson_id: int) -> dict:
+    """student_id → [{"id", "value"}] по порядку выставления (удалённые отброшены)."""
+    by_student: dict = {}
+    for x in mesh.get_marks(schedule_lesson_id):
+        if not isinstance(x, dict) or x.get("deleted_by") is not None:
+            continue
+        sid = x.get("student_profile_id")
+        if not sid:
+            continue
+        by_student.setdefault(sid, []).append({"id": x.get("id"), "value": str(x.get("name") or "?")})
+    for v in by_student.values():
+        v.sort(key=lambda r: r["id"] or 0)
+    return by_student
+
+
+def lesson_absences(mesh, schedule_lesson_id: int) -> dict:
+    """student_id → {"id", "reason"} (reason: 1 = Н, 2 = УП)."""
+    res: dict = {}
+    for a in mesh.get_attendances(schedule_lesson_id):
+        if isinstance(a, dict) and a.get("student_profile_id"):
+            res[a["student_profile_id"]] = {"id": a.get("id"), "reason": a.get("absence_reason_id") or 1}
+    return res
+
+
+def grades_data(mesh, schedule_lesson_id=None) -> dict:
+    lesson = resolve_current(mesh, schedule_lesson_id)
+    lid = lesson["schedule_lesson_id"]
+    marks = lesson_marks(mesh, lid)
+    data = {
+        "lesson": lesson_public(lesson),
+        "grades": {sid: [r["value"] for r in rs] for sid, rs in marks.items()},
+        "mark_ids": marks,
+        "absences": {},
+        "absence_ids": {},
+    }
+    # ошибка чтения отсутствий не должна ломать оценки
+    try:
+        ab = lesson_absences(mesh, lid)
+        data["absences"] = {sid: a["reason"] for sid, a in ab.items()}
+        data["absence_ids"] = {sid: a["id"] for sid, a in ab.items()}
+    except Exception as e:
+        print(f"attendances: {e}", file=sys.stderr)
+    return data
+
+
+def act_data(m, mesh, kind: str, student_id=None, grade=None, dry: bool = False,
+             schedule_lesson_id=None, group_id=None, student_ids=None) -> dict:
+    """Записать в журнал. В ответе created: student_id → id новой записи (для удаления)."""
     from datetime import datetime
-    m, mesh = fresh_mesh()
     cur_lesson = resolve_current(mesh, schedule_lesson_id, group_id)
-    control_form_id, theme_id = m.get_lesson_params(mesh, cur_lesson)
+    lid = cur_lesson["schedule_lesson_id"]
+    with redirect_stdout(sys.stderr):
+        control_form_id, theme_id = m.get_lesson_params(mesh, cur_lesson)
     base = {
         "lesson": lesson_public(cur_lesson),
         "control_form_id": control_form_id,
@@ -158,85 +193,158 @@ def cmd_act(kind: str, student_id=None, grade=None, dry: bool = False,
     }
     if dry:
         base["dry"] = True
-        return out(base)
+        return base
     if control_form_id is None or theme_id is None:
         base["error"] = "параметры урока не определены (форма контроля/тема)"
-        return out(base)
+        return base
     if kind == "mark":
         if grade is None or student_id is None:
             base["error"] = "нужны --student-id и --grade"
-            return out(base)
+            return base
         with redirect_stdout(sys.stderr):
-            mesh.add_mark(
-                schedule_lesson_id=cur_lesson["schedule_lesson_id"],
+            resp = mesh.add_mark(
+                schedule_lesson_id=lid,
                 student_profile_id=student_id,
                 teacher_id=int(mesh.profile_id),
                 grade=int(grade),
                 control_form_id=control_form_id,
                 theme_frame_integration_id=theme_id,
             )
+        mid = resp.get("id") if isinstance(resp, dict) else None
+        if not mid:
+            # ответ без id — берём самую свежую такую оценку ученика на уроке
+            same = [r for r in lesson_marks(mesh, lid).get(student_id, []) if r["value"] == str(grade)]
+            mid = same[-1]["id"] if same else None
+        base["created"] = {student_id: mid}
         base["result"] = "ok"
-        return out(base)
+        return base
     if kind == "absence":
-        if student_id is None:
-            base["error"] = "нужен --student-id"
-            return out(base)
+        ids = list(student_ids or []) or ([student_id] if student_id is not None else [])
+        if not ids:
+            base["error"] = "нужен --student-id или --student-ids"
+            return base
+        done, failed, created = [], {}, {}
         with redirect_stdout(sys.stderr):
-            mesh.add_absence(
-                schedule_lesson_id=cur_lesson["schedule_lesson_id"],
-                student_profile_id=student_id,
-                teacher_id=int(mesh.profile_id),
-            )
-        base["result"] = "ok"
-        return out(base)
+            for sid in ids:
+                try:
+                    resp = mesh.add_absence(
+                        schedule_lesson_id=lid,
+                        student_profile_id=sid,
+                        teacher_id=int(mesh.profile_id),
+                    )
+                    done.append(sid)
+                    if isinstance(resp, dict) and resp.get("id"):
+                        created[sid] = resp["id"]
+                except Exception as e:
+                    failed[sid] = str(e)[:160]
+        if len(created) < len(done):
+            try:
+                ab = lesson_absences(mesh, lid)
+                for sid in done:
+                    if sid not in created and sid in ab:
+                        created[sid] = ab[sid]["id"]
+            except Exception as e:
+                print(f"attendances: {e}", file=sys.stderr)
+        base["done"] = done
+        base["created"] = created
+        if failed:
+            base["failed"] = failed
+            if not done:
+                base["error"] = f"Н не выставлены: {next(iter(failed.values()))}"
+                return base
+        base["result"] = "ok" if not failed else "partial"
+        return base
     if kind == "nohomework":
         grp = cur_lesson.get("group_id")
         if not grp:
             base["error"] = "не найден group_id текущего урока"
-            return out(base)
+            return base
         with redirect_stdout(sys.stderr):
             if mesh.homework_absence_exists(grp, datetime.now().strftime("%d.%m.%Y")):
                 base["result"] = "already"
-                return out(base)
+                return base
             mesh.add_homework_absence(grp, datetime.now())
         base["result"] = "ok"
-        return out(base)
+        return base
     base["error"] = f"неизвестное действие {kind}"
-    return out(base)
+    return base
+
+
+def delete_data(mesh, kind: str, ids) -> dict:
+    """Удалить оценки (kind=mark) или Н (kind=absence) по id записей."""
+    fn = {"mark": mesh.delete_mark, "absence": mesh.delete_attendance}.get(kind)
+    if fn is None:
+        return {"error": f"неизвестный вид удаления {kind}"}
+    deleted, failed = [], {}
+    with redirect_stdout(sys.stderr):
+        for i in ids:
+            try:
+                fn(int(i))
+                deleted.append(int(i))
+            except Exception as e:
+                failed[int(i)] = str(e)[:160]
+    res = {"deleted": deleted}
+    if failed:
+        res["failed"] = failed
+        if not deleted:
+            res["error"] = f"не удалено: {next(iter(failed.values()))}"
+    return res
+
+
+# ---------- CLI ----------
+
+def _ids(v: str):
+    return [int(x) for x in v.split(",") if x.strip()]
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["today", "students", "status", "act", "grades"])
-    args, rest = ap.parse_known_args()
-
-    # шум библиотек (get_token, api-логи v3) — в stderr; JSON — только в настоящий stdout
+    global REAL_OUT
+    # «настоящий» stdout для JSON; шум библиотек (get_token, api-логи v3) — в stderr
+    REAL_OUT = os.fdopen(os.dup(1), "w", encoding="utf-8", newline="\n")
     sys.stdout = sys.stderr
 
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", choices=["today", "students", "status", "act", "grades", "delete"])
+    args, rest = ap.parse_known_args()
+
     try:
-        if args.command == "today":
-            return cmd_today()
         if args.command == "grades":
             p = argparse.ArgumentParser()
             p.add_argument("--schedule-lesson-id", type=int)
             a = p.parse_args(rest)
-            return cmd_grades(a.schedule_lesson_id)
-        if args.command == "students":
+        elif args.command == "students":
             p = argparse.ArgumentParser()
             p.add_argument("--group-id", type=int, required=True)
             a = p.parse_args(rest)
-            return cmd_students(a.group_id)
+        elif args.command == "delete":
+            p = argparse.ArgumentParser()
+            p.add_argument("kind", choices=["mark", "absence"])
+            p.add_argument("--ids", type=_ids, required=True)
+            a = p.parse_args(rest)
+        elif args.command == "act":
+            p = argparse.ArgumentParser()
+            p.add_argument("kind", choices=["mark", "absence", "nohomework"])
+            p.add_argument("--student-id", type=int)
+            p.add_argument("--student-ids", type=_ids)
+            p.add_argument("--grade", type=int)
+            p.add_argument("--dry", action="store_true")
+            p.add_argument("--schedule-lesson-id", type=int)
+            p.add_argument("--group-id", type=int)
+            a = p.parse_args(rest)
+
+        m, mesh = fresh_mesh()
+        if args.command == "today":
+            return out(today_data(mesh))
         if args.command == "status":
-            return cmd_status()
-        p = argparse.ArgumentParser()
-        p.add_argument("kind", choices=["mark", "absence", "nohomework"])
-        p.add_argument("--student-id", type=int)
-        p.add_argument("--grade", type=int)
-        p.add_argument("--dry", action="store_true")
-        p.add_argument("--schedule-lesson-id", type=int)
-        p.add_argument("--group-id", type=int)
-        a = p.parse_args(rest)
-        return cmd_act(a.kind, a.student_id, a.grade, a.dry, a.schedule_lesson_id, a.group_id)
+            return out(status_data(mesh))
+        if args.command == "grades":
+            return out(grades_data(mesh, a.schedule_lesson_id))
+        if args.command == "students":
+            return out(students_data(mesh, a.group_id))
+        if args.command == "delete":
+            return out(delete_data(mesh, a.kind, a.ids))
+        return out(act_data(m, mesh, a.kind, a.student_id, a.grade, a.dry,
+                            a.schedule_lesson_id, a.group_id, a.student_ids))
     except RuntimeError as e:
         return die(str(e))
     except SystemExit as e:  # RuntimeError с сообщением внутри v3 бывают и тут

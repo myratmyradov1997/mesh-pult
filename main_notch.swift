@@ -93,13 +93,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var autoHideTimer: Timer?
     var studentsCache: [Int: [[String: Any]]] = [:]
     var gradesCache: [Int: [Int: [String]]] = [:]   // scheduleLessonId → studentId → [оценки]
-    var absenceCache: [Int: Set<Int>] = [:]          // scheduleLessonId → studentId (Н, выставлен пультом)
+    var absenceCache: [Int: [Int: Int]] = [:]        // scheduleLessonId → studentId → причина (1 = Н, 2 = УП)
     var expandedKeys: Set<String> = []               // раскрытые блоки/уроки
     var blockChoice: [String: Int] = [:]             // blockKey → индекс активного урока в блоке
     var cacheDay = ""                                // для ежедневной очистки кэшей
     var preloadedDay = ""                            // день предзагрузки (ученики/оценки)
     var resultLine = ""
     var selectedLessonIdx: Int?
+    var markIds: [Int: [Int: [MarkRef]]] = [:]      // scheduleLessonId → studentId → оценки с id
+    var absenceIds: [Int: [Int: Int]] = [:]          // scheduleLessonId → studentId → id отметки Н
+    var history: [DoneAction] = []                   // что поставил пульт: «Отменить» удаляет последнее
+    var inFlight: Set<String> = []                   // запросы в пути: kind-student-lesson
+    var rollCall: [String: Set<Int>] = [:]           // ключ раскрытия → отмеченные отсутствующие
 
     /// Ежедневная очистка кэшей: ученики/оценки/подсветки перестраиваются с нового дня
     private func todayYMD() -> String {
@@ -113,6 +118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             studentsCache.removeAll()
             gradesCache.removeAll()
             absenceCache.removeAll()
+            markIds.removeAll()
+            absenceIds.removeAll()
+            history.removeAll()
             expandedKeys.removeAll()
             selectedLessonIdx = nil
             cacheDay = t
@@ -290,32 +298,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: действия
 
-    func perform(kind: String, studentId: Int? = nil, grade: Int? = nil,
-                 lessonId: Int? = nil, name: String = "", blockKey: String? = nil) {
-        var args = ["act", kind]
-        if let studentId { args += ["--student-id", String(studentId)] }
-        if let grade { args += ["--grade", String(grade)] }
-        if let lessonId, lessonId != 0 { args += ["--schedule-lesson-id", String(lessonId)] }
-        resultLine = "выполняю \(tag(kind)) \(name)…"
-        if panel?.isVisible == true { contentView.headerText(vals: lessons) }
-        bridge(args) { [weak self] res in
-            guard let self else { return }
-            switch res {
-            case .success:
-                self.resultLine = "✅ \(tag(kind)) \(name) — готово"
-                // Н: запомнить для подсветки (API чтения отсутствий недоступен)
-                if kind == "absence", let lessonId, lessonId != 0, let studentId {
-                    var set = self.absenceCache[lessonId] ?? Set<Int>()
-                    set.insert(studentId)
-                    self.absenceCache[lessonId] = set
+    /// Записать в МЭШ сразу. Ошибочную запись снимает повторный клик или «↩︎ Отменить».
+    func perform(kind: String, studentIds: [Int] = [], grade: Int? = nil,
+                 lessonIds: [Int] = [], name: String) {
+        let a = ActionRef(kind: kind, studentIds: studentIds, grade: grade, name: name)
+        // nohomework без урока — «текущий урок» по расписанию
+        for lid in (lessonIds.isEmpty ? [0] : lessonIds) {
+            let keys = studentIds.map { flightKey(kind, $0, lid, grade) }
+            if keys.contains(where: inFlight.contains) { continue }   // двойной клик, запрос ещё идёт
+            inFlight.formUnion(keys)
+            var args = ["act", kind]
+            if studentIds.count == 1 { args += ["--student-id", String(studentIds[0])] }
+            if studentIds.count > 1 { args += ["--student-ids", studentIds.map(String.init).joined(separator: ",")] }
+            if let grade { args += ["--grade", String(grade)] }
+            if lid != 0 { args += ["--schedule-lesson-id", String(lid)] }
+            resultLine = "выполняю \(a.title)…"
+            rerender()
+            bridge(args) { [weak self] res in
+                guard let self else { return }
+                self.inFlight.subtract(keys)
+                switch res {
+                case .success(let d):
+                    let failed = (d["failed"] as? [String: Any])?.count ?? 0
+                    self.resultLine = failed == 0
+                        ? "✅ \(a.title) — готово"
+                        : "⚠️ \(a.title) — не прошло у \(failed) уч."
+                    let created = ((d["created"] as? [String: Any]) ?? [:]).values.compactMap { $0 as? Int }
+                    if !created.isEmpty, lid != 0, kind != "nohomework" {
+                        self.history.append(DoneAction(kind: kind, ids: created, lessonId: lid, title: a.title))
+                    }
+                    // Н: подсветить сразу, не дожидаясь перечитывания урока
+                    if kind == "absence", lid != 0 {
+                        for sid in (d["done"] as? [Int]) ?? studentIds {
+                            self.absenceCache[lid, default: [:]][sid] = 1
+                        }
+                    }
+                    // обновить подсветку оценок и Н урока (и id записей для удаления)
+                    if lid != 0 { self.loadGrades(lessonId: lid) }
+                case .failure(let e):
+                    self.resultLine = "⚠️ \(a.title): \(e.localizedDescription)"
                 }
-                // обновить подсветку оценок урока
-                if let lessonId, lessonId != 0 { self.loadGrades(lessonId: lessonId) }
-            case .failure(let e):
-                self.resultLine = "⚠️ \(e.localizedDescription)"
+                self.rerender()
             }
-            if self.panel?.isVisible == true { self.contentView.headerText(vals: self.lessons) }
         }
+    }
+
+    /// Удалить записи из журнала (kind: mark | absence) по их id
+    func deleteRecords(kind: String, ids: [Int], lessonId: Int, title: String) {
+        let key = "del-\(kind)-\(ids.map(String.init).joined(separator: ","))"
+        guard !ids.isEmpty, !inFlight.contains(key) else { return }
+        inFlight.insert(key)
+        resultLine = "удаляю \(title)…"
+        rerender()
+        bridge(["delete", kind, "--ids", ids.map(String.init).joined(separator: ",")]) { [weak self] res in
+            guard let self else { return }
+            self.inFlight.remove(key)
+            switch res {
+            case .success(let d):
+                let failed = (d["failed"] as? [String: Any])?.count ?? 0
+                self.resultLine = failed == 0 ? "🗑 удалено: \(title)" : "⚠️ \(title): не удалено \(failed) из \(ids.count)"
+                self.history.removeAll { $0.ids.contains(where: ids.contains) }
+            case .failure(let e):
+                self.resultLine = "⚠️ удаление \(title): \(e.localizedDescription)"
+            }
+            self.loadGrades(lessonId: lessonId)
+            self.rerender()
+        }
+    }
+
+    func flightKey(_ kind: String, _ student: Int, _ lessonId: Int, _ grade: Int?) -> String {
+        "\(kind)-\(student)-\(lessonId)" + (grade.map { "-\($0)" } ?? "")
+    }
+
+    /// идёт запрос по этой кнопке — подсветить жёлтым
+    func isInFlight(kind: String, student: Int, lessonId: Int?, grade: Int?) -> Bool {
+        guard let lessonId else { return false }
+        return inFlight.contains(flightKey(kind, student, lessonId, grade))
+    }
+
+    func rerender() {
+        if panel?.isVisible == true { contentView.headerText(vals: lessons) }
+    }
+
+    /// «↩︎ Отменить»: удалить последнее, что пульт поставил в этой сессии
+    @objc func doUndo(_ sender: NSButton) {
+        guard let last = history.popLast() else {
+            resultLine = "нечего отменять: пульт сегодня ещё ничего не ставил"
+            rerender()
+            return
+        }
+        deleteRecords(kind: last.kind, ids: last.ids, lessonId: last.lessonId, title: last.title)
     }
 
     @objc func doGrade(_ sender: TagButton) {
@@ -329,12 +401,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // если не загрузили оценки этого урока — подгрузим при первом открытии
             if let lid = lessonId, gradesCache[lid] == nil { loadGrades(lessonId: lid) }
         }
+        let sid = info["student"] as? Int
+        let grade = info["grade"] as? Int
+        let name = info["name"] as? String ?? ""
+        // повторный клик по уже выставленному на этом уроке — удалить запись
+        if let sid, let lid = lessonId, lid != 0 {
+            if kind == "mark", let grade,
+               let ref = markIds[lid]?[sid]?.last(where: { $0.value == String(grade) }) {
+                deleteRecords(kind: "mark", ids: [ref.id], lessonId: lid, title: "\(grade) \(name)")
+                return
+            }
+            if kind == "absence", let reason = absenceCache[lid]?[sid] {
+                if reason == 2 {
+                    resultLine = "УП у \(name) снимается только в журнале МЭШ"
+                    rerender()
+                } else if let aid = absenceIds[lid]?[sid] {
+                    deleteRecords(kind: "absence", ids: [aid], lessonId: lid, title: "Н \(name)")
+                } else {
+                    resultLine = "Н \(name): обновляю данные урока, нажми ещё раз"
+                    loadGrades(lessonId: lid)
+                    rerender()
+                }
+                return
+            }
+        }
         perform(kind: kind,
-                studentId: info["student"] as? Int,
-                grade: info["grade"] as? Int,
-                lessonId: lessonId,
-                name: info["name"] as? String ?? "",
-                blockKey: info["blockKey"] as? String)
+                studentIds: sid.map { [$0] } ?? [],
+                grade: grade,
+                lessonIds: lessonId.flatMap { $0 == 0 ? nil : [$0] } ?? [],
+                name: name)
+    }
+
+    // MARK: перекличка
+
+    @objc func doRollStart(_ sender: TagButton) {
+        guard let k = sender.payload?["expKey"] as? String else { return }
+        rollCall[k] = []
+        rerender()
+    }
+
+    @objc func doRollToggle(_ sender: TagButton) {
+        guard let k = sender.payload?["expKey"] as? String,
+              let sid = sender.payload?["student"] as? Int, rollCall[k] != nil else { return }
+        if rollCall[k]!.contains(sid) { rollCall[k]!.remove(sid) } else { rollCall[k]!.insert(sid) }
+        rerender()
+    }
+
+    @objc func doRollCancel(_ sender: TagButton) {
+        guard let k = sender.payload?["expKey"] as? String else { return }
+        rollCall[k] = nil
+        rerender()
+    }
+
+    /// «Отправить Н»: все отмеченные одним пакетом, тоже через окно отмены
+    @objc func doRollSubmit(_ sender: TagButton) {
+        guard let k = sender.payload?["expKey"] as? String,
+              let ids = rollCall[k], !ids.isEmpty,
+              let lids = sender.payload?["lessonIds"] as? [Int], !lids.isEmpty else { return }
+        rollCall[k] = nil
+        let where_ = lids.count > 1 ? " на \(lids.count) урока" : ""
+        perform(kind: "absence", studentIds: ids.sorted(), lessonIds: lids,
+              name: "перекличка: \(ids.count) уч.\(where_)")
     }
 
     @objc func doChooseLesson(_ sender: TagButton) {
@@ -413,6 +540,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     g[sid] = names
                 }
                 self.gradesCache[lessonId] = g
+                var a: [Int: Int] = [:]
+                for (k, v) in (d["absences"] as? [String: Any]) ?? [:] {
+                    guard let sid = Int(k) else { continue }
+                    a[sid] = (v as? Int) ?? 1
+                }
+                self.absenceCache[lessonId] = a
+                var mi: [Int: [MarkRef]] = [:]
+                for (k, v) in (d["mark_ids"] as? [String: Any]) ?? [:] {
+                    guard let sid = Int(k), let rs = v as? [[String: Any]] else { continue }
+                    mi[sid] = rs.compactMap { r in
+                        guard let id = r["id"] as? Int, let val = r["value"] as? String else { return nil }
+                        return MarkRef(id: id, value: val)
+                    }
+                }
+                self.markIds[lessonId] = mi
+                var ai: [Int: Int] = [:]
+                for (k, v) in (d["absence_ids"] as? [String: Any]) ?? [:] {
+                    if let sid = Int(k), let id = v as? Int { ai[sid] = id }
+                }
+                self.absenceIds[lessonId] = ai
                 if self.panel?.isVisible == true { self.contentView.headerText(vals: self.lessons) }
             case .failure:
                 break   // нет оценок / ошибка чтения — просто без подсветки
@@ -515,6 +662,32 @@ final class TagButton: NSButton {
     var payload: [String: Any]?
 }
 
+/// Что отправляем в МЭШ (для строки результата)
+struct ActionRef {
+    let kind: String
+    let studentIds: [Int]
+    let grade: Int?
+    let name: String
+
+    var title: String {
+        let what = kind == "mark" ? (grade.map(String.init) ?? "оценка") : tag(kind)
+        return kind == "absence" && studentIds.count > 1 ? name : "\(what) \(name)"
+    }
+}
+
+/// Поставленное пультом: id записей, чтобы «Отменить» мог их удалить
+struct DoneAction {
+    let kind: String
+    let ids: [Int]
+    let lessonId: Int
+    let title: String
+}
+
+struct MarkRef {
+    let id: Int
+    let value: String
+}
+
 final class LessonRowButton: NSButton {
     var lessonIndex: Int = -1
     var blockKey: String = ""
@@ -583,6 +756,7 @@ final class PanelView: NSView {
 
         let btnBar = NSStackView(views: [
             button("Без д/з сейчас", action: #selector(AppDelegate.doNoHW(_:))),
+            button("↩︎ Отменить", action: #selector(AppDelegate.doUndo(_:))),
             button("Обновить", action: #selector(AppDelegate.doRefresh(_:))),
             button("✕", action: #selector(AppDelegate.doClose(_:))),
         ])
@@ -706,23 +880,25 @@ final class PanelView: NSView {
                 let key = "blk\(i)-\(count)-\(l.groupId)"
                 let time = [block.first!.begin, block.last!.end].compactMap({$0}).joined(separator: "–")
                 let dot = block.contains { $0.isCurrent } ? "🟢" : "⚪️"
-                let hdr = blockButton("\(dot) \(time)  \(l.subject) · \(l.group) · \(count) урока",
+                let hdr = blockButton("\(dot) \(time)  \(l.subject) · \(l.group) · \(count) урока\(absenceSummary(block))",
                                       key: key, width: cfg.panelWidth - 28)
                 documentStack.addArrangedSubview(hdr)
                 if app.expandedKeys.contains(key) {
                     let activeIdx = app.activeLessonIdxInBlock(key, block: block)
                     addChooserRow(block: block, key: key, activeIdx: activeIdx)
-                    addStudentsRow(block: block, activeIdx: activeIdx, blockKey: key)
+                    addStudentsRow(block: block, activeIdx: activeIdx, blockKey: key, expKey: key)
                 }
                 i = j
             } else {
                 let t = [l.begin, l.end].compactMap { $0 }.joined(separator: "–")
                 let dot = l.isCurrent ? "🟢" : "⚪️"
-                let row = rowButton("\(dot) \(t)  \(l.subject) · \(l.group)",
+                let row = rowButton("\(dot) \(t)  \(l.subject) · \(l.group)\(absenceSummary([l]))",
                                     action: #selector(AppDelegate.pickLesson(_:)),
                                     index: i, width: cfg.panelWidth - 28)
                 documentStack.addArrangedSubview(row)
-                if app.expandedKeys.contains("les\(i)") { addStudentsRow(block: [l], activeIdx: 0, blockKey: nil) }
+                if app.expandedKeys.contains("les\(i)") {
+                    addStudentsRow(block: [l], activeIdx: 0, blockKey: nil, expKey: "les\(i)")
+                }
                 i += 1
             }
         }
@@ -765,20 +941,39 @@ final class PanelView: NSView {
         documentStack.addArrangedSubview(wrap)
     }
 
+    /// « · Н 2 · УП 5» для строки урока/блока: ученик считается один раз на блок
+    private func absenceSummary(_ block: [Lesson]) -> String {
+        var reasons: [Int: Int] = [:]
+        for l in block {
+            guard let lid = l.scheduleLessonId else { continue }
+            for (sid, r) in app?.absenceCache[lid] ?? [:] where reasons[sid] == nil { reasons[sid] = r }
+        }
+        let up = reasons.values.filter { $0 == 2 }.count
+        let n = reasons.count - up
+        return (n > 0 ? " · Н \(n)" : "") + (up > 0 ? " · УП \(up)" : "")
+    }
+
     private func i_of(_ block: [Lesson], _ l: Lesson) -> Int {
         app?.lessons.firstIndex(where: { $0.scheduleLessonId == l.scheduleLessonId }) ?? 0
     }
 
-    func addStudentsRow(block: [Lesson], activeIdx: Int, blockKey: String?) {
+    func addStudentsRow(block: [Lesson], activeIdx: Int, blockKey: String?, expKey: String) {
         guard let app, let first = block.first, first.groupId != 0 else { return }
-        let lesson = block[activeIdx]
         let groupId = first.groupId
         let wrap = NSStackView()
         wrap.orientation = .vertical
         wrap.spacing = 3
         wrap.alignment = .leading
         if let st = app.studentsCache[groupId] {
-            renderStudents(into: wrap, students: st, block: block, activeIdx: activeIdx, blockKey: blockKey)
+            if let marked = app.rollCall[expKey] {
+                renderRollCall(into: wrap, students: st, block: block, activeIdx: activeIdx,
+                               expKey: expKey, marked: marked)
+            } else {
+                let start = smallButton("📋 Перекличка", action: #selector(AppDelegate.doRollStart(_:)),
+                                        payload: ["expKey": expKey])
+                wrap.addArrangedSubview(indented([start]))
+                renderStudents(into: wrap, students: st, block: block, activeIdx: activeIdx, blockKey: blockKey)
+            }
         } else {
             let loading = NSStackView()
             loading.orientation = .horizontal
@@ -794,6 +989,78 @@ final class PanelView: NSView {
         }
     }
 
+    private func indented(_ views: [NSView]) -> NSStackView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 6
+        row.alignment = .centerY
+        let sp = NSView(); sp.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        row.addArrangedSubview(sp)
+        views.forEach { row.addArrangedSubview($0) }
+        return row
+    }
+
+    private func smallButton(_ s: String, action: Selector, payload: [String: Any],
+                             bg: NSColor = NSColor.white.withAlphaComponent(0.10),
+                             color: NSColor = .white, width: CGFloat? = nil) -> TagButton {
+        let b = TagButton(title: s, target: app, action: action)
+        let bf = NSFont.systemFont(ofSize: 11, weight: .medium)
+        b.bezelStyle = .inline
+        b.controlSize = .small
+        b.font = bf
+        b.attributedTitle = NSAttributedString(string: s, attributes: [.foregroundColor: color, .font: bf])
+        b.payload = payload
+        b.wantsLayer = true
+        b.layer?.cornerRadius = 6
+        b.layer?.borderWidth = 0.5
+        b.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        b.layer?.backgroundColor = bg.cgColor
+        if let width {
+            b.widthAnchor.constraint(equalToConstant: width).isActive = true
+            b.alignment = .left
+        }
+        return b
+    }
+
+    /// Перекличка: клик по ученику — отметить отсутствующим; уже отсутствующие — без клика
+    func renderRollCall(into wrap: NSStackView, students: [[String: Any]], block: [Lesson],
+                        activeIdx: Int, expKey: String, marked: Set<Int>) {
+        let activeLid = block[activeIdx].scheduleLessonId
+        let hint = block.count > 1 ? "Отметь отсутствующих (урок \(activeIdx + 1)-й)" : "Отметь отсутствующих"
+        wrap.addArrangedSubview(indented([label(hint, size: 10, bold: false,
+                                                color: NSColor.white.withAlphaComponent(0.6))]))
+        for st in students {
+            guard let id = st["id"] as? Int, let name = st["name"] as? String else { continue }
+            if let lid = activeLid, let r = app?.absenceCache[lid]?[id] {
+                let done = label("\(r == 2 ? "УП" : "Н") · \(name) — уже в журнале", size: 12, bold: false,
+                                 color: NSColor.white.withAlphaComponent(0.4))
+                wrap.addArrangedSubview(indented([done]))
+                continue
+            }
+            let on = marked.contains(id)
+            let b = smallButton(on ? "Н · \(name)" : name, action: #selector(AppDelegate.doRollToggle(_:)),
+                                payload: ["expKey": expKey, "student": id],
+                                bg: on ? NSColor.systemOrange.withAlphaComponent(0.45) : NSColor.white.withAlphaComponent(0.04),
+                                width: cfg.panelWidth - 80)
+            wrap.addArrangedSubview(indented([b]))
+        }
+        var btns: [NSView] = []
+        let ids = block.compactMap { $0.scheduleLessonId }
+        if let lid = activeLid {
+            btns.append(smallButton("Отправить Н (\(marked.count))", action: #selector(AppDelegate.doRollSubmit(_:)),
+                                    payload: ["expKey": expKey, "lessonIds": [lid]],
+                                    bg: NSColor.systemOrange.withAlphaComponent(marked.isEmpty ? 0.15 : 0.45)))
+        }
+        if ids.count > 1 {
+            btns.append(smallButton("Н на все \(ids.count) урока", action: #selector(AppDelegate.doRollSubmit(_:)),
+                                    payload: ["expKey": expKey, "lessonIds": ids],
+                                    bg: NSColor.systemOrange.withAlphaComponent(marked.isEmpty ? 0.15 : 0.30)))
+        }
+        btns.append(smallButton("Отмена", action: #selector(AppDelegate.doRollCancel(_:)),
+                                payload: ["expKey": expKey]))
+        wrap.addArrangedSubview(indented(btns))
+    }
+
     func renderStudents(into wrap: NSStackView, students: [[String: Any]],
                         block: [Lesson], activeIdx: Int, blockKey: String?) {
         // оценки/Н ВСЕХ уроков блока: активный урок — бирюза, соседний — фиолет
@@ -805,11 +1072,16 @@ final class PanelView: NSView {
             row.alignment = .centerY
             let sp = NSView(); sp.widthAnchor.constraint(equalToConstant: 14).isActive = true
             row.addArrangedSubview(sp)
-            let nameL = label("\(name)", size: 12, bold: false, color: NSColor.white)
+            let activeLesson = block[activeIdx]
+            // отсутствующий (Н/УП) на активном уроке, иначе на любом уроке блока — приглушить имя
+            let reason = activeLesson.scheduleLessonId.flatMap { app?.absenceCache[$0]?[id] }
+                ?? block.lazy.compactMap { $0.scheduleLessonId.flatMap { app?.absenceCache[$0]?[id] } }.first
+            let nameText = reason == nil ? name : "\(reason == 2 ? "УП" : "Н") · \(name)"
+            let nameL = label(nameText, size: 12, bold: false,
+                              color: reason == nil ? NSColor.white : NSColor.white.withAlphaComponent(0.4))
             nameL.widthAnchor.constraint(equalToConstant: 170).isActive = true
             nameL.lineBreakMode = .byTruncatingTail
             row.addArrangedSubview(nameL)
-            let activeLesson = block[activeIdx]
             for g in [5, 4, 3, 2, 0] {
                 var rep: [String: Any] = g == 0
                     ? ["kind": "absence", "student": id, "name": name, "lessonId": activeLesson.scheduleLessonId ?? 0]
@@ -842,10 +1114,15 @@ final class PanelView: NSView {
                 if g == 0 {
                     for ls in block {
                         guard let lid = ls.scheduleLessonId,
-                              let set = app?.absenceCache[lid], set.contains(id) else { continue }
+                              app?.absenceCache[lid]?[id] != nil else { continue }
                         b.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.45).cgColor
                         break
                     }
+                }
+                // запрос в пути — жёлтым поверх остальных подсветок
+                if app?.isInFlight(kind: g == 0 ? "absence" : "mark", student: id,
+                                   lessonId: activeLesson.scheduleLessonId, grade: g == 0 ? nil : g) == true {
+                    b.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.55).cgColor
                 }
                 b.widthAnchor.constraint(equalToConstant: 24).isActive = true
                 row.addArrangedSubview(b)

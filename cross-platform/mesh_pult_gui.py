@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Пульт МЭШ — кроссплатформенная версия (Windows / Linux / macOS).
+"""Пульт МЭШ — кроссплатформенная версия (Windows / Linux / macOS без чёлки).
 
-Один файл. Го-открыли dot-py двойным кликом — работает.
-Автоматически берёт токен из cookies Chrome/Edge/Helium/Firefox (нужно
-только один раз войти в https://school.mos.ru в браузере). Профиль учителя
-(Profile-Id) в первый запуск вводится один раз, дальше сохраняется.
+Окно со списком уроков дня: клик по уроку → ученики → 5 4 3 2 Н.
+Уже выставленные оценки и Н подсвечены; повторный клик по подсвеченной кнопке
+удаляет запись; «↩ Отменить» удаляет последнее, что поставил пульт.
+«☑ Перекличка» — отметить отсутствующих и отправить Н одним пакетом.
 
-Не требуется Microsoft Office / Node / Docker.
+Токен берётся из cookies браузера (нужно один раз войти в https://school.mos.ru),
+Profile-Id — из Local Storage браузера. Вся работа с API — в mesh_remote.py
+(те же функции, что у Mac-версии).
+
+Ключ --selftest: отрисовать окно на тестовых данных без сети и выйти (для CI).
 """
 import os
 import sys
+import re
 import json
 import base64
 import datetime
 import threading
 import queue
-import traceback
+import webbrowser
+
+VERSION = "1.1.0"
+REPO = "myratmyradov1997/mesh-pult"
+
+# PyInstaller --windowed: stdout/stderr отсутствуют, а v3 печатает логи
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = sys.stdout
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (_HERE, os.path.dirname(_HERE)):
@@ -31,16 +45,25 @@ C_PANEL = "#22252b"
 C_ROW = "#2e323a"
 C_ROW_CUR = "#3a4048"
 C_TEXT = "#e8eaf0"
-C_DIM = "#9aa0aa"
-C_ACCENT = "#3ecfc3"  # teal
-C_PURPLE = "#a78bfa"
-C_ORANGE = "#f59e0b"
-C_DANGER = "#ef4444"
+C_DIM = "#8a909a"
+C_ACCENT = "#2a9d94"   # оценка на активном уроке
+C_PURPLE = "#7c5fd6"   # оценка на соседнем уроке двойного
+C_ORANGE = "#c27a12"   # Н
+C_YELLOW = "#b59a1c"   # запрос в пути
+C_OK = "#3ecfc3"
+C_ERR = "#f87171"
+
+FONT = ("Segoe UI", 10)
+FONT_B = ("Segoe UI", 10, "bold")
+FONT_S = ("Segoe UI", 9)
 
 TOKEN_FILE = os.path.expanduser("~/.mesh_token")
 REFRESH_FILE = os.path.expanduser("~/.mesh_refresh_token")
 PROFILE_FILE = os.path.expanduser("~/.mesh_profile_id")
+SETTINGS_FILE = os.path.expanduser("~/.mesh_pult_settings.json")
 
+
+# ---------- токен и профиль ----------
 
 def jwt_data(token):
     payload = token.split(".")[1]
@@ -51,11 +74,9 @@ def jwt_data(token):
 def token_valid(token):
     try:
         exp = jwt_data(token).get("exp")
-        if exp and exp > datetime.datetime.now().timestamp():
-            return True
+        return bool(exp and exp > datetime.datetime.now().timestamp())
     except Exception:
-        pass
-    return False
+        return False
 
 
 def read_token():
@@ -69,22 +90,35 @@ def read_token():
     return None
 
 
+def token_left_s(token):
+    try:
+        return jwt_data(token).get("exp", 0) - datetime.datetime.now().timestamp()
+    except Exception:
+        return 0
+
+
 def try_get_token():
-    """Цепочка: файл → refresh → браузер (без интерактивных prompt)."""
+    """Цепочка: файл → refresh → браузер (без интерактивных prompt).
+
+    Токен, которому осталось меньше 30 минут, заранее продлеваем через refresh.
+    """
     import mesh_automation_v3 as v3
     tok = read_token()
-    if tok:
+    if tok and (token_left_s(tok) > 30 * 60 or not os.path.exists(REFRESH_FILE)):
         return tok, None
-    # 1) refresh (если был refresh-токен в файле)
     try:
         tok = v3.refresh_mesh_token()
         if tok:
             return tok, None
     except Exception as e:
         print("refresh ошибка:", e, file=sys.stderr)
-    # 2) из cookies браузера (Chrome/Edge/Helium/Firefox)
+    if tok:
+        return tok, None   # refresh не удался, но старый ещё действует
+    tok = token_from_browsers()
+    if tok:
+        return tok, None
     try:
-        tok = v3.get_token_from_browser()
+        tok = v3.get_token_from_browser()   # macOS: Helium/Chrome
         if tok:
             try:
                 open(TOKEN_FILE, "w").write(tok)
@@ -94,7 +128,61 @@ def try_get_token():
             return tok, None
     except Exception as e:
         print("cookie ошибка:", e, file=sys.stderr)
-    return None, "не найден токен. Откройте https://school.mos.ru и войдите в «Кабинет учителя», затем нажмите «Обновить»."
+    return None, "нет входа"
+
+
+def token_from_browsers():
+    """aupd_token из cookies установленных браузеров; aupd_refresh_token — чтобы продлевать вход.
+
+    Новый Chrome/Edge на Windows может шифровать cookies так, что их не прочитать, —
+    тогда остаётся Firefox или ручной вход (окно «Вход в МЭШ»).
+    """
+    try:
+        import browser_cookie3 as bc
+    except Exception:
+        return None
+    for name in ("chrome", "edge", "yandex", "firefox", "chromium", "brave", "opera", "vivaldi", "librewolf"):
+        fn = getattr(bc, name, None)
+        if not fn:
+            continue
+        try:
+            jar = list(fn(domain_name="mos.ru"))
+        except Exception as e:
+            print(f"cookies {name}: {e}", file=sys.stderr)
+            continue
+        access = next((c.value for c in jar if c.name == "aupd_token" and token_valid(c.value)), None)
+        refresh = next((c.value for c in jar if c.name == "aupd_refresh_token" and c.value), None)
+        if access:
+            try:
+                open(TOKEN_FILE, "w").write(access)
+                os.chmod(TOKEN_FILE, 0o600)
+                if refresh:
+                    open(REFRESH_FILE, "w").write(refresh)
+                    os.chmod(REFRESH_FILE, 0o600)
+            except Exception:
+                pass
+            return access
+    return None
+
+
+def save_login(value):
+    """Ручной вход: значение cookie aupd_refresh_token (или aupd_token) из браузера.
+
+    Сначала пробуем как refresh-токен (тогда пульт дальше продлевает вход сам),
+    иначе — как готовый токен доступа.
+    """
+    import mesh_automation_v3 as v3
+    value = value.strip().strip('"')
+    open(REFRESH_FILE, "w").write(value)
+    os.chmod(REFRESH_FILE, 0o600)
+    if v3.refresh_mesh_token():
+        return
+    os.remove(REFRESH_FILE)
+    if value.count(".") == 2 and token_valid(value):
+        open(TOKEN_FILE, "w").write(value)
+        os.chmod(TOKEN_FILE, 0o600)
+        return
+    raise RuntimeError("значение не подошло — скопируйте aupd_refresh_token целиком")
 
 
 def read_profile():
@@ -105,7 +193,6 @@ def read_profile():
         p = open(PROFILE_FILE).read().strip()
         if p:
             return p
-    # автоматом из Local Storage браузера (обычный кейс — найдётся)
     auto = find_profile_id_storage()
     if auto:
         save_profile(auto)
@@ -115,45 +202,40 @@ def read_profile():
 
 def save_profile(pid):
     try:
-        open(PROFILE_FILE, "w").write(str(pid))
+        open(PROFILE_FILE, "w").write(str(pid).strip())
         os.chmod(PROFILE_FILE, 0o600)
     except Exception:
         pass
 
 
 def find_profile_id_storage():
-    """Profile-Id из Local Storage браузера (Chrome/Edge/Helium/Firefox).
-
-    school.mos.ru сам хранит profile_id в localStorage (браузерный фронт
-    отправляет его в заголовке Profile-Id), поэтому его можно вытащить
-    прямо из leveldb-файлов браузера — без ручного ввода.
-    """
-    import re
+    """Profile-Id из Local Storage браузера: school.mos.ru хранит там profile_id."""
     import shutil
     import tempfile
     import glob
     rootdirs = [
-        os.environ.get("LOCALAPPDATA"),  # Windows: Chrome/Edge там
-        os.path.expanduser("~/.config"),  # Linux: chromium
+        os.environ.get("LOCALAPPDATA"),  # Windows: Chrome/Edge/Yandex
+        os.path.expanduser("~/.config"),  # Linux
         os.path.expanduser("~/Library/Application Support"),  # macOS
     ]
     browsers = [
-        "Google/Chrome", "Microsoft/Edge", "Chromium", "chromium",
-        "net.imput.helium", "BraveSoftware/Brave-Browser",
-        "Yandex/YandexBrowser", "Vivaldi",
+        "Google/Chrome", "Microsoft/Edge", "Chromium", "chromium", "google-chrome",
+        "microsoft-edge", "net.imput.helium", "BraveSoftware/Brave-Browser",
+        "Yandex/YandexBrowser", "yandex-browser", "Vivaldi", "vivaldi",
     ]
     found = []
     for rootdir in rootdirs:
         if not rootdir:
             continue
         for b in browsers:
-            for sub in (os.path.join(rootdir, b, "Default", "Local Storage", "leveldb"),
+            for sub in (os.path.join(rootdir, b, "User Data", "Default", "Local Storage", "leveldb"),
+                        os.path.join(rootdir, b, "Default", "Local Storage", "leveldb"),
                         os.path.join(rootdir, b, "Local Storage", "leveldb")):
                 if not os.path.isdir(sub):
                     continue
                 tmp = tempfile.mkdtemp(prefix="meshpult_ls_")
                 try:
-                    for f in glob.glob(os.path.join(sub, "*.ldb")):
+                    for f in glob.glob(os.path.join(sub, "*.ldb")) + glob.glob(os.path.join(sub, "*.log")):
                         try:
                             dst = os.path.join(tmp, os.path.basename(f))
                             shutil.copy(f, dst)
@@ -166,58 +248,103 @@ def find_profile_id_storage():
                     shutil.rmtree(tmp, ignore_errors=True)
     if not found:
         return None
-    return max(set(found), key=found.count)  # самый частый (сквозь несколько файлов)
+    return max(set(found), key=found.count)
 
 
-def work():
-    """Вызовы API в work-потоке (нужен отдельный thread под GUI)."""
-    pass
+def load_settings():
+    try:
+        return json.load(open(SETTINGS_FILE, encoding="utf-8"))
+    except Exception:
+        return {}
 
+
+def save_settings(s):
+    try:
+        json.dump(s, open(SETTINGS_FILE, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+
+
+# ---------- окно ----------
 
 class PultApp:
-    def __init__(self, root):
+    def __init__(self, root, offline=False):
         self.root = root
+        self.offline = offline
         self.q = queue.Queue()
+        self.v3 = None
+        self.remote = None
+        self.mesh = None
         self.lessons = []
-        self.blocks = []           # список {"lessons": [...]}
+        self.students = {}       # group_id → [{id, name}]
+        self.grades = {}         # lesson_id → student_id → ["5", …]
+        self.mark_ids = {}       # lesson_id → student_id → [{id, value}]
+        self.absences = {}       # lesson_id → student_id → 1 (Н) | 2 (УП)
+        self.absence_ids = {}    # lesson_id → student_id → id отметки
         self.expanded = set()
-        self.block_choice = {}     # blockKey -> индекс активного урока
-        self.students_cache = {}
-        self.grades_cache = {}
-        self.absence_cache = {}
+        self.block_choice = {}   # ключ блока → индекс активного урока в блоке
+        self.roll = {}           # ключ блока → отмеченные на перекличке
+        self.history = []        # поставленное пультом: {kind, ids, lesson_id, title}
+        self.in_flight = set()
         self.cache_day = ""
         self.token_exp = ""
-        self.mesh = None
-        self.mods = None
-        self.busy = False
+        self.result = ""
+        self.result_err = False
+        self.update = None       # {"version", "url"} если на GitHub есть новее
+        self.settings = load_settings()
 
-        root.title("Пульт МЭШ")
-        root.geometry("560x720")
+        root.title(f"Пульт МЭШ {VERSION}")
+        root.geometry(self.settings.get("geometry") or "600x760")
+        root.minsize(480, 400)
         root.configure(bg=C_BG)
+        self._set_icon()
+        root.attributes("-topmost", bool(self.settings.get("topmost")))
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build()
-        self._tick()
-        # автозапуск апдейта через 400 мс
-        root.after(400, self.refresh_all)
+        self._pump()
+        if not offline:
+            root.after(300, self.refresh_all)
+            root.after(1500, self.check_update)
+            root.after(5 * 60 * 1000, self._periodic)
 
-    # ---------- UI ----------
+    def _set_icon(self):
+        base = getattr(sys, "_MEIPASS", _HERE)   # в сборке PyInstaller файлы лежат в _MEIPASS
+        try:
+            self._icon = tk.PhotoImage(file=os.path.join(base, "icon.png"))
+            self.root.iconphoto(True, self._icon)
+        except Exception:
+            pass
+
+    # ---------- каркас ----------
     def _build(self):
         top = tk.Frame(self.root, bg=C_PANEL)
         top.pack(fill="x")
         self.status = tk.Label(top, text="Пульт МЭШ", bg=C_PANEL, fg=C_TEXT,
-                               font=("Segoe UI", 12, "bold"), anchor="w")
+                               font=("Segoe UI", 11, "bold"), anchor="w")
         self.status.pack(side="left", padx=10, pady=8)
-        self.btn_refresh = tk.Button(top, text="Обновить", command=self.refresh_all,
-                                     bg=C_ROW, fg=C_TEXT, activebackground=C_ROW_CUR,
-                                     activeforeground=C_TEXT, relief="flat", padx=10)
-        self.btn_refresh.pack(side="right", padx=6, pady=8)
-        self.btn_nohw = tk.Button(top, text="Без д/з сейчас", command=self.do_nohw,
-                                  bg=C_ROW, fg=C_TEXT, activebackground=C_ROW_CUR,
-                                  activeforeground=C_TEXT, relief="flat", padx=10)
-        self.btn_nohw.pack(side="right", padx=6, pady=8)
+        bar = tk.Frame(self.root, bg=C_PANEL)
+        bar.pack(fill="x")
+        for text, cmd in (("Без д/з сейчас", self.do_nohw),
+                          ("↩ Отменить", self.do_undo),
+                          ("Обновить", self.refresh_all)):
+            self._btn(bar, text, C_ROW, cmd).pack(side="left", padx=(8, 0), pady=(0, 8))
+        self.topmost = tk.BooleanVar(value=bool(self.settings.get("topmost")))
+        tk.Checkbutton(bar, text="Поверх окон", variable=self.topmost, command=self.toggle_topmost,
+                       bg=C_PANEL, fg=C_TEXT, selectcolor=C_ROW, activebackground=C_PANEL,
+                       activeforeground=C_TEXT, font=FONT_S, bd=0,
+                       highlightthickness=0).pack(side="right", padx=8, pady=(0, 8))
 
-        # скроллящаяся область
-        self.canvas = tk.Canvas(self.root, bg=C_BG, highlightthickness=0)
-        self.scroll = ttk.Scrollbar(self.root, orient="vertical", command=self.canvas.yview)
+        self.banner = tk.Frame(self.root, bg=C_BG)
+        self.banner.pack(fill="x")
+
+        mid = tk.Frame(self.root, bg=C_BG)
+        mid.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(mid, bg=C_BG, highlightthickness=0)
+        self.scroll = ttk.Scrollbar(mid, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scroll.set)
         self.body = tk.Frame(self.canvas, bg=C_BG)
         self.canvas.create_window((0, 0), window=self.body, anchor="nw", tags="body")
@@ -225,352 +352,578 @@ class PultApp:
         self.body.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scroll.pack(side="right", fill="y")
-        self._bind_wheel()
+        self.canvas.bind_all("<MouseWheel>", self._wheel)
+        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-2, "units"))
+        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(2, "units"))
 
-    def _bind_wheel(self):
-        def on_wheel(e):
-            n = -1 if getattr(e, "delta", 0) > 0 or getattr(e, "num", 4) in (4,) else 1
-            self.canvas.yview_scroll(n, "units")
-        self.canvas.bind_all("<MouseWheel>", on_wheel)
-        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        self.result_label = tk.Label(self.root, text="", bg=C_PANEL, fg=C_OK, font=FONT_S,
+                                     anchor="w", justify="left", wraplength=560)
+        self.result_label.pack(fill="x", ipady=6, ipadx=8)
 
-    def _mkrow(self, parent, text, bg, fg, on_click=None):
-        f = tk.Frame(parent, bg=bg, pady=8, padx=10)
-        l = tk.Label(f, text=text, bg=bg, fg=fg, anchor="w",
-                     font=("Segoe UI", 10), wraplength=460, justify="left")
-        l.pack(fill="x")
-        if on_click:
-            f.bind("<Button-1>", lambda e: on_click())
-            l.bind("<Button-1>", lambda e: on_click())
-            f.configure(cursor="hand2")
-            l.configure(cursor="hand2")
-        return f
+    def _wheel(self, e):
+        if e.delta:
+            # Windows: ±120 за щелчок; macOS: мелкие значения
+            step = -int(e.delta / 120) if abs(e.delta) >= 120 else (-1 if e.delta > 0 else 1)
+            self.canvas.yview_scroll(step, "units")
 
-    def _mkbtn(self, parent, text, bg, fg, cmd):
-        b = tk.Button(parent, text=text, bg=bg, fg=fg, activebackground=bg,
-                      activeforeground=fg, relief="flat", padx=8, pady=3,
-                      font=("Segoe UI", 9, "bold"), command=cmd, cursor="hand2")
+    def _btn(self, parent, text, bg, cmd, fg=C_TEXT, width=None, font=FONT_S):
+        b = tk.Button(parent, text=text, bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+                      relief="flat", bd=0, padx=8, pady=3, font=font, command=cmd,
+                      cursor="hand2", highlightthickness=0)
+        if width:
+            b.configure(width=width)
         return b
 
-    def render(self):
-        for w in self.body.winfo_children():
-            w.destroy()
-        if not self.lessons:
-            self._mkrow(self.body, "Нет уроков сегодня.", C_ROW, C_TEXT).pack(fill="x", pady=4)
-        # группировка сдвоенных уроков
-        self.blocks = []
-        i = 0
-        while i < len(self.lessons):
-            grp = self.lessons[i].get("group_id")
-            j = i
-            while (j + 1 < len(self.lessons)
-                   and self.lessons[j + 1].get("group_id") == grp
-                   and grp is not None):
-                j += 1
-            self.blocks.append({"lessons": [self.lessons[k] for k in range(i, j + 1)]})
-            i = j + 1
-        for bi, blk in enumerate(self.blocks):
-            ls = blk["lessons"]
-            key = f"blk{bi}"
-            is_current = any(l.get("is_current") for l in ls)
-            bg = C_ROW_CUR if is_current else C_ROW
-            if len(ls) == 1:
-                l = ls[0]
-                t = ("🟢 " if is_current else "⚪️ ") + \
-                    (f"{l.get('begin','?')}–{l.get('end','?')} " if l.get("begin") else "") + \
-                    f"{l.get('subject','?')} · {l.get('group','?')}"
-                w = self._mkrow(self.body, t, bg, C_TEXT,
-                                on_click=lambda bi=bi: self.toggle(bi))
-                w.pack(fill="x", padx=8, pady=3)
-                self.chrome(bi)
-            else:
-                t = ("🟢 " if is_current else "⚪️ ") + \
-                    f"{ls[0].get('begin','?')}–{ls[-1].get('end','?')} " + \
-                    f"{ls[0].get('subject','?')} · {ls[0].get('group','?')} · " + \
-                    f"{len(ls)} урока"
-                w = self._mkrow(self.body, t, bg, C_TEXT,
-                                on_click=lambda bi=bi: self.toggle(bi))
-                w.pack(fill="x", padx=8, pady=3)
-                self.chrome(bi)
-            if bi in self.expanded:
-                self.render_detail(bi, key)
-        self.status.config(text=f"Уроков: {len(self.lessons)} · токен до {self.token_exp}")
+    def toggle_topmost(self):
+        self.settings["topmost"] = bool(self.topmost.get())
+        self.root.attributes("-topmost", self.settings["topmost"])
+        save_settings(self.settings)
 
-    def render_detail(self, bi, key):
-        blk = self.blocks[bi]
-        act = self.block_choice.get(key, 0)
-        wrap = tk.Frame(self.body, bg=C_BG)
-        wrap.pack(fill="x", padx=16, pady=(0, 6))
-        active = blk["lessons"][act]
-        if len(blk["lessons"]) > 1:
-            tk.Label(wrap, text="Отметки идут в:", bg=C_BG, fg=C_DIM,
-                     font=("Segoe UI", 9)).pack(anchor="w")
-            row = tk.Frame(wrap, bg=C_BG)
-            row.pack(anchor="w", pady=2)
-            for k2, l in enumerate(blk["lessons"]):
-                sel = (k2 == act)
-                b = self._mkbtn(row, f"{k2+1}-й ({l.get('begin','?')})",
-                                C_ACCENT if sel else C_ROW, C_TEXT,
-                                cmd=lambda k2=k2: self.pick_lesson(bi, key, k2))
-                b.pack(side="left", padx=3)
-        st = self.students_cache.get(active.get("group_id"))
-        if st is None:
-            tk.Label(wrap, text="Загружаю учеников…", bg=C_BG, fg=C_DIM,
-                     font=("Segoe UI", 9)).pack(anchor="w")
-            self.load_students(active.get("group_id"), bi)
-            return
-        gid = active.get("group_id")
-        gl_active = self.grades_cache.get(active.get("schedule_lesson_id"), {})
-        for s in st:
-            row = tk.Frame(wrap, bg=C_BG)
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=s["name"], bg=C_BG, fg=C_TEXT,
-                     font=("Segoe UI", 9), width=24, anchor="w").pack(side="left")
-            for g in [5, 4, 3, 2]:
-                set_active = str(g) in (gl_active.get(s["id"]) or [])
-                set_other = any(
-                    str(g) in (self.grades_cache.get(o["schedule_lesson_id"], {}).get(s["id"]) or [])
-                    for o in blk["lessons"] if o is not active)
-                bg = C_ACCENT if set_active else (C_PURPLE if set_other else C_ROW)
-                b = self._mkbtn(row, str(g), bg, C_TEXT,
-                                cmd=lambda g=g, s=s: self.do_mark(bi, key, s, g))
-                b.pack(side="left", padx=2)
-            set_h = (s["id"] in self.absence_cache.get(active.get("schedule_lesson_id") or 0, set()))
-            nb = self._mkbtn(row, "Н", C_ORANGE if set_h else C_ROW,
-                             C_TEXT, cmd=lambda s=s: self.do_absence(bi, key, s))
-            nb.pack(side="left", padx=2)
+    def on_close(self):
+        self.settings["geometry"] = self.root.geometry()
+        save_settings(self.settings)
+        self.root.destroy()
 
-    def chrome(self, bi):
-        """Держим пустое место под деталями Выделенного урока."""
-        pass
-
-    # ---------- Логика ----------
-    def pick_lesson(self, bi, key, idx):
-        self.block_choice[key] = idx
-        self.render()
-
-    def toggle(self, bi):
-        key = f"blk{bi}"
-        if key in self.expanded:
-            self.expanded.remove(key)
-        else:
-            blk = self.blocks[bi]
-            idx = next((i for i, l in enumerate(blk["lessons"]) if l.get("is_current")),
-                       len(blk["lessons"]) - 1)
-            self.block_choice[key] = idx
-            self.expanded.add(key)
-            # грузим оценки всех уроков блока
-            for l in blk["lessons"]:
-                sid = l.get("schedule_lesson_id")
-                if sid and sid not in self.grades_cache:
-                    self.fetch_grades(sid, bi)
-        self.render()
-
-    def _worker(self, fn, after):
-        t = threading.Thread(target=lambda: self.q.put(("result", fn(), after)), daemon=True)
-        t.start()
+    # ---------- фоновые задачи ----------
+    def run(self, fn, ok, err=None):
+        """fn — в отдельном потоке; ok/err — в потоке окна через очередь."""
+        def work():
+            try:
+                res = fn()
+                self.q.put((ok, res))
+            except Exception as e:
+                self.q.put((err or self.fail, e))
+        threading.Thread(target=work, daemon=True).start()
 
     def _pump(self):
+        changed = False
         while True:
             try:
-                kind, data, after = self.q.get_nowait()
+                cb, val = self.q.get_nowait()
             except queue.Empty:
                 break
-            if kind == "error":
-                self.fail(data)
-            else:
-                after(data)
+            try:
+                cb(val)
+            except Exception as e:
+                self.set_result(f"Ошибка окна: {type(e).__name__}: {e}", err=True)
+            changed = True
+        if changed:
+            self.render()
+        self.root.after(100, self._pump)
 
-    def load_students(self, gid, bi):
-        def do():
-            return self.mods.get_student_profiles(gid)
-        threading.Thread(target=lambda: self._thread_students(gid), daemon=True).start()
+    def set_result(self, text, err=False):
+        self.result = text
+        self.result_err = err
+        self.result_label.configure(text=text, fg=C_ERR if err else C_OK)
 
-    def _thread_students(self, gid):
-        try:
-            st = self.mods.get_student_profiles(gid)
-            self.q.put(("result", gid, st))
-        except Exception as e:
-            self.q.put(("error", f"Ученики: {e}", None))
+    def fail(self, e):
+        self.set_result(f"⚠ {e}", err=True)
 
-    def fetch_grades(self, sid, bi):
-        threading.Thread(target=lambda: self._thread_grades(sid), daemon=True).start()
-
-    def _thread_grades(self, sid):
-        try:
-            ms = self.mods.get_marks(sid)
-            by = {}
-            for x in ms or []:
-                if not isinstance(x, dict) or x.get("deleted_by") is not None:
-                    continue
-                spid = x.get("student_profile_id")
-                if not spid:
-                    continue
-                name = str(x.get("name") or "?")
-                by.setdefault(spid, []).append(name)
-            self.q.put(("result", sid, by))
-        except Exception as e:
-            self.q.put(("error", f"Оценки: {e}", None))
+    # ---------- данные ----------
+    def _connect(self):
+        """Поток: токен + профиль → MeshAutomation."""
+        import mesh_automation_v3 as v3
+        import mesh_remote as remote
+        self.v3, self.remote = v3, remote
+        tok, err = try_get_token()
+        if not tok:
+            return "login"
+        pid = read_profile()
+        if not pid:
+            return None
+        return v3.MeshAutomation(bearer_token=tok, profile_id=str(pid))
 
     def refresh_all(self):
-        self.status.config(text="Загрузка…")
-        threading.Thread(target=self._thread_full, daemon=True).start()
+        self.status.configure(text="Загрузка…")
 
-    def _thread_full(self):
-        try:
-            import mesh_automation_v3 as v3
-            tok, err = try_get_token()
-            if not tok:
-                self.q.put(("error", err, None)); return
-            pid = read_profile()
-            if not pid:
-                self.q.put(("need_profile", None, None)); return
-            self.mods = v3.MeshAutomation(bearer_token=tok, profile_id=str(pid))
-            ls = self.mods.get_daily_schedule()
-            today = datetime.date.today().strftime("%Y-%m-%d")
+        def fn():
+            mesh = self._connect()
+            if mesh is None or mesh == "login":
+                return mesh
+            data = self.remote.today_data(mesh)
+            data["token_expires"] = self.remote.token_expires(mesh)
+            return mesh, data
+
+        def ok(res):
+            if res is None:
+                self.status.configure(text="Нужен Profile-Id (один раз)")
+                self.ask_profile()
+                return
+            if res == "login":
+                self.status.configure(text="Нужен вход в МЭШ")
+                self.ask_login()
+                return
+            self.mesh, data = res
+            today = datetime.date.today().isoformat()
             if self.cache_day != today:
                 self.cache_day = today
-                self.students_cache.clear()
-                self.grades_cache.clear()
-                self.absence_cache.clear()
+                for d in (self.students, self.grades, self.mark_ids, self.absences, self.absence_ids):
+                    d.clear()
                 self.expanded.clear()
-            self.lessons = []
-            for l in ls:
-                begin = l.get("time_start") or l.get("begin_time")
-                end = l.get("time_end") or l.get("end_time")
-                cur = False
-                try:
-                    b = datetime.datetime.strptime(begin, "%H:%M")
-                    e2 = datetime.datetime.strptime(end or begin, "%H:%M")
-                    now = datetime.datetime.now()
-                    cur = b <= now <= e2
-                except Exception:
-                    pass
-                self.lessons.append({
-                    "begin": begin, "end": end, "cur": cur,
-                    "subject": l.get("subject_name") or "?",
-                    "group": l.get("group_name") or l.get("class_unit_name") or "?",
-                    "group_id": l.get("group_id"),
-                    "schedule_lesson_id": l.get("schedule_lesson_id"),
-                    "is_current": cur,
-                })
-            exp = ""
-            try:
-                exp = datetime.datetime.fromtimestamp(
-                    jwt_data(tok)["exp"]).strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                pass
-            self.q.put(("result", None, exp))
-        except Exception as e:
-            self.q.put(("error", str(e), None))
+                self.roll.clear()
+                self.history.clear()
+            self.lessons = data["lessons"]
+            self.token_exp = data.get("token_expires") or ""
+            self.preload()
 
-    def _pump(self):
-        while True:
+        def err(e):
+            self.status.configure(text="Нет связи с МЭШ")
+            self.fail(e)
+
+        self.run(fn, ok, err)
+
+    def _periodic(self):
+        self.refresh_all()
+        self.root.after(5 * 60 * 1000, self._periodic)
+
+    def preload(self):
+        """Ученики всех групп и оценки/Н всех уроков дня — чтобы клик не ждал сеть."""
+        for gid in {l["group_id"] for l in self.lessons if l.get("group_id")}:
+            if gid not in self.students:
+                self.load_students(gid)
+        for l in self.lessons:
+            if l.get("schedule_lesson_id"):
+                self.load_lesson(l["schedule_lesson_id"])
+
+    def load_students(self, gid):
+        mesh = self.mesh
+
+        def ok(d):
+            self.students[gid] = d["students"]
+        self.run(lambda: self.remote.students_data(mesh, gid), ok)
+
+    def load_lesson(self, lid):
+        mesh = self.mesh
+
+        def ok(d):
+            self.grades[lid] = d["grades"]
+            self.mark_ids[lid] = d["mark_ids"]
+            self.absences[lid] = d["absences"]
+            self.absence_ids[lid] = d["absence_ids"]
+        self.run(lambda: self.remote.grades_data(mesh, lid), ok)
+
+    def ask_login(self):
+        """Cookies браузера прочитать не удалось (так бывает с новым Chrome на Windows)."""
+        if getattr(self, "_login_asked", False):
+            self.set_result("Нет входа в МЭШ: войдите на school.mos.ru и нажмите «Обновить»", err=True)
+            return
+        self._login_asked = True
+        import tkinter.simpledialog as sd
+        v = sd.askstring(
+            "Вход в МЭШ",
+            "Пульт не смог взять вход из браузера.\n\n"
+            "1. Откройте https://school.mos.ru и войдите в «Кабинет учителя».\n"
+            "2. Нажмите F12 → вкладка «Application» (Приложение) → Cookies → https://school.mos.ru.\n"
+            "3. Найдите строку aupd_refresh_token и скопируйте её значение (Value).\n\n"
+            "Вставьте значение — дальше пульт будет продлевать вход сам:",
+            parent=self.root)
+        if v and v.strip():
             try:
-                kind, data, extra = self.q.get_nowait()
-            except queue.Empty:
+                save_login(v)
+            except Exception as e:
+                self.fail(e)
                 return
-            if kind == "result":
-                if extra and isinstance(extra, str) and "токен" not in extra:
-                    self.token_exp = extra
-                if kind == "result":
-                    self.token_exp = extra if extra else self.token_exp
-                self._tick()
-            elif kind == "need_profile":
-                self.status.config(text="Нужен Profile-Id (один раз)")
-                self.ask_profile()
-            elif kind == "need_token":
-                self.status.config(text="Войдите в school.mos.ru и нажмите Обновить")
-            elif kind == "error":
-                self.fail(data)
-
-    def _thread_full2(self):
-        self._thread_full()
-
-    def _tick(self):
-        self.render()
-        self.root.after(200, self._pump)
+            self.refresh_all()
+        else:
+            self.set_result("Нет входа в МЭШ: войдите на school.mos.ru и нажмите «Обновить»", err=True)
 
     def ask_profile(self):
-        d = messagebox.askyesno(
-            "Профиль учителя",
-            "Откройте school.mos.ru → «Журнал» → F12 → вкладка Network →\n"
-            "выберите любой запрос к api → в заголовках найдите Profile-Id.\n"
-            "Это число нужно скопировать и вставить один раз.\n\n"
-            "Вставить сейчас?")
-        if not d:
-            return
         import tkinter.simpledialog as sd
-        pid = sd.askstring("Profile-Id", "Ваш Profile-Id (только число):")
-        if pid:
-            save_profile(pid.id if hasattr(pid, "id") else pid)
+        pid = sd.askstring(
+            "Профиль учителя",
+            "Не удалось найти Profile-Id автоматически.\n\n"
+            "Откройте school.mos.ru → «Журнал» → F12 → Network → любой запрос к api →\n"
+            "в заголовках найдите Profile-Id и вставьте это число:",
+            parent=self.root)
+        if pid and pid.strip().isdigit():
+            save_profile(pid.strip())
             self.refresh_all()
 
-    def do_mark(self, bi, key, student, grade):
-        blk = self.blocks[bi]
-        act = blk["lessons"][self.block_choice.get(key, 0)]
-        sid = act.get("schedule_lesson_id")
-        st_id = student["id"]
-        threading.Thread(target=self._thread_mark, args=(sid, st_id, grade), daemon=True).start()
+    def check_update(self):
+        def fn():
+            import requests
+            r = requests.get(f"https://api.github.com/repos/{REPO}/releases/latest", timeout=8)
+            r.raise_for_status()
+            return r.json()
 
-    def _thread_mark(self, sid, st_id, grade):
-        try:
-            m = self.mods
-            lesson = next(l for l in m.get_daily_schedule()
-                          if l.get("schedule_lesson_id") == sid)
-            cfid, tid = m.get_lesson_params(m, lesson)
-            m.add_mark(schedule_lesson_id=sid, student_profile_id=st_id,
-                       teacher_id=int(m.profile_id), grade=int(grade),
-                       control_form_id=cfid, theme_frame_integration_id=tid)
-            self.q.put(("result", sid, {"grade": grade, "student": st_id}))
-        except Exception as e:
-            self.q.put(("error", f"Оценка: {e}", None))
+        def ok(d):
+            tag = d.get("tag_name") or ""
+            if version_tuple(tag) > version_tuple(VERSION):
+                self.update = {"version": tag, "url": d.get("html_url")}
+                self.show_update()
 
-    def do_absence(self, bi, key, student):
-        blk = self.blocks[bi]
-        act = blk["lessons"][self.block_choice.get(key, 0)]
-        sid = act.get("schedule_lesson_id")
-        threading.Thread(target=self._thread_absence, args=(sid, student["id"]), daemon=True).start()
+        self.run(fn, ok, lambda e: None)   # нет сети — молча
 
-    def _thread_absence(self, sid, st_id):
-        try:
-            m = self.mods
-            m.add_absence(
-                schedule_lesson_id=sid,
-                student_profile_id=st_id,
-                teacher_id=int(m.profile_id),
-                absence_reason_id=1,   # 1 = Н (неуважительная)
-            )
-            self.q.put(("result", sid, {"absence": st_id}))
-        except Exception as e:
-            self.q.put(("error", f"Н: {e}", None))
+    def show_update(self):
+        for w in self.banner.winfo_children():
+            w.destroy()
+        if not self.update:
+            return
+        f = tk.Frame(self.banner, bg=C_PURPLE)
+        f.pack(fill="x")
+        tk.Label(f, text=f"Доступна новая версия {self.update['version']}", bg=C_PURPLE, fg=C_TEXT,
+                 font=FONT_S).pack(side="left", padx=10, pady=5)
+        self._btn(f, "Скачать", C_ROW, lambda: webbrowser.open(self.update["url"])).pack(
+            side="right", padx=8, pady=4)
+
+    # ---------- уроки и блоки ----------
+    def blocks(self):
+        """Подряд идущие уроки одной группы — один блок (двойной урок)."""
+        out, i = [], 0
+        while i < len(self.lessons):
+            j = i + 1
+            gid = self.lessons[i].get("group_id")
+            while j < len(self.lessons) and gid and self.lessons[j].get("group_id") == gid:
+                j += 1
+            out.append((f"b{i}-{j - i}-{gid}", self.lessons[i:j]))
+            i = j
+        return out
+
+    def active_idx(self, key, ls):
+        if key in self.block_choice and self.block_choice[key] < len(ls):
+            return self.block_choice[key]
+        for k, l in enumerate(ls):
+            if l.get("is_current"):
+                return k
+        return len(ls) - 1
+
+    def absence_summary(self, ls):
+        reasons = {}
+        for l in ls:
+            for sid, r in self.absences.get(l.get("schedule_lesson_id"), {}).items():
+                reasons.setdefault(sid, r)
+        up = sum(1 for r in reasons.values() if r == 2)
+        n = len(reasons) - up
+        return (f" · Н {n}" if n else "") + (f" · УП {up}" if up else "")
+
+    # ---------- отрисовка ----------
+    def render(self):
+        y = self.canvas.yview()[0]
+        for w in self.body.winfo_children():
+            w.destroy()
+        n = len(self.lessons)
+        head = f"Уроков: {n}" if n else "Уроков сегодня нет"
+        if any(l.get("is_current") for l in self.lessons):
+            head += " · ● идёт урок"
+        if self.token_exp:
+            head += f" · вход до {self.token_exp}"
+        if self.mesh or self.offline:
+            self.status.configure(text=head)
+        for key, ls in self.blocks():
+            self.render_block(key, ls)
+        self.body.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.canvas.yview_moveto(y)
+
+    def render_block(self, key, ls):
+        cur = any(l.get("is_current") for l in ls)
+        first, last = ls[0], ls[-1]
+        t = ("● " if cur else "○ ") + f"{first.get('begin') or '?'}–{last.get('end') or '?'}  " \
+            f"{first.get('subject', '?')} · {first.get('group', '?')}"
+        if len(ls) > 1:
+            t += f" · {len(ls)} урока"
+        t += self.absence_summary(ls)
+        bg = C_ROW_CUR if cur else C_ROW
+        row = tk.Frame(self.body, bg=bg, padx=10, pady=7, cursor="hand2")
+        row.pack(fill="x", padx=8, pady=3)
+        lbl = tk.Label(row, text=t, bg=bg, fg=C_TEXT, font=FONT, anchor="w", justify="left",
+                       wraplength=520, cursor="hand2")
+        lbl.pack(fill="x")
+        for w in (row, lbl):
+            w.bind("<Button-1>", lambda e, k=key: self.toggle(k))
+        if key not in self.expanded:
+            return
+        act = self.active_idx(key, ls)
+        wrap = tk.Frame(self.body, bg=C_BG)
+        wrap.pack(fill="x", padx=18, pady=(0, 8))
+        if len(ls) > 1:
+            r = tk.Frame(wrap, bg=C_BG)
+            r.pack(anchor="w", pady=(2, 4))
+            tk.Label(r, text="Отметки идут в:", bg=C_BG, fg=C_DIM, font=FONT_S).pack(side="left")
+            for k, l in enumerate(ls):
+                self._btn(r, f"{k + 1}-й ({l.get('begin') or '?'})", C_ACCENT if k == act else C_ROW,
+                          lambda k=k: self.pick(key, k)).pack(side="left", padx=3)
+        gid = first.get("group_id")
+        st = self.students.get(gid)
+        if st is None:
+            tk.Label(wrap, text="Загружаю учеников…", bg=C_BG, fg=C_DIM, font=FONT_S).pack(anchor="w")
+            return
+        if not st:
+            tk.Label(wrap, text="Ученики не найдены", bg=C_BG, fg=C_DIM, font=FONT_S).pack(anchor="w")
+            return
+        if key in self.roll:
+            self.render_roll(wrap, key, ls, act, st)
+        else:
+            self._btn(wrap, "☑ Перекличка", C_ROW, lambda: self.roll_start(key)).pack(anchor="w", pady=(0, 4))
+            self.render_students(wrap, key, ls, act, st)
+
+    def render_students(self, wrap, key, ls, act, st):
+        active = ls[act]
+        alid = active.get("schedule_lesson_id")
+        for s in st:
+            sid = s["id"]
+            reason = self.absences.get(alid, {}).get(sid)
+            if reason is None:
+                reason = next((self.absences.get(l.get("schedule_lesson_id"), {}).get(sid)
+                               for l in ls if sid in self.absences.get(l.get("schedule_lesson_id"), {})), None)
+            name = s["name"] if reason is None else f"{'УП' if reason == 2 else 'Н'} · {s['name']}"
+            row = tk.Frame(wrap, bg=C_BG)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=name, bg=C_BG, fg=C_DIM if reason else C_TEXT, font=FONT_S,
+                     width=30, anchor="w").pack(side="left")
+            for g in (5, 4, 3, 2, 0):
+                kind = "absence" if g == 0 else "mark"
+                if g:
+                    bg = C_ROW
+                    for k, l in enumerate(ls):
+                        if str(g) in self.grades.get(l.get("schedule_lesson_id"), {}).get(sid, []):
+                            bg = C_ACCENT if k == act else C_PURPLE
+                            break
+                else:
+                    bg = C_ORANGE if any(sid in self.absences.get(l.get("schedule_lesson_id"), {}) for l in ls) else C_ROW
+                if self.flight_key(kind, sid, alid, g or None) in self.in_flight:
+                    bg = C_YELLOW
+                self._btn(row, "Н" if g == 0 else str(g), bg,
+                          lambda s=s, g=g: self.on_grade(key, s, g), width=2,
+                          font=FONT_B).pack(side="left", padx=2)
+
+    def render_roll(self, wrap, key, ls, act, st):
+        alid = ls[act].get("schedule_lesson_id")
+        marked = self.roll[key]
+        hint = "Отметь отсутствующих" + (f" (урок {act + 1}-й)" if len(ls) > 1 else "")
+        tk.Label(wrap, text=hint, bg=C_BG, fg=C_DIM, font=FONT_S).pack(anchor="w")
+        for s in st:
+            sid = s["id"]
+            r = self.absences.get(alid, {}).get(sid)
+            if r is not None:
+                tk.Label(wrap, text=f"{'УП' if r == 2 else 'Н'} · {s['name']} — уже в журнале",
+                         bg=C_BG, fg=C_DIM, font=FONT_S, anchor="w").pack(fill="x", pady=1)
+                continue
+            on = sid in marked
+            self._btn(wrap, ("Н · " if on else "") + s["name"], C_ORANGE if on else C_ROW,
+                      lambda sid=sid: self.roll_toggle(key, sid)).pack(fill="x", pady=1)
+        r = tk.Frame(wrap, bg=C_BG)
+        r.pack(anchor="w", pady=(4, 0))
+        lids = [l.get("schedule_lesson_id") for l in ls if l.get("schedule_lesson_id")]
+        self._btn(r, f"Отправить Н ({len(marked)})", C_ORANGE,
+                  lambda: self.roll_submit(key, [alid])).pack(side="left", padx=(0, 4))
+        if len(lids) > 1:
+            self._btn(r, f"Н на все {len(lids)} урока", C_ORANGE,
+                      lambda: self.roll_submit(key, lids)).pack(side="left", padx=4)
+        self._btn(r, "Отмена", C_ROW, lambda: self.roll_cancel(key)).pack(side="left", padx=4)
+
+    # ---------- действия ----------
+    def toggle(self, key):
+        if key in self.expanded:
+            self.expanded.discard(key)
+        else:
+            self.expanded.add(key)
+            ls = dict(self.blocks()).get(key) or []
+            if self.mesh and ls:
+                if ls[0].get("group_id") and ls[0]["group_id"] not in self.students:
+                    self.load_students(ls[0]["group_id"])
+                for l in ls:
+                    if l.get("schedule_lesson_id") and l["schedule_lesson_id"] not in self.grades:
+                        self.load_lesson(l["schedule_lesson_id"])
+        self.render()
+
+    def pick(self, key, k):
+        self.block_choice[key] = k
+        self.render()
+
+    def flight_key(self, kind, sid, lid, grade=None):
+        return f"{kind}-{sid}-{lid}" + (f"-{grade}" if grade else "")
+
+    def on_grade(self, key, s, g):
+        ls = dict(self.blocks()).get(key)
+        if not ls:
+            return
+        lid = ls[self.active_idx(key, ls)].get("schedule_lesson_id")
+        sid, name = s["id"], s["name"]
+        if g:
+            # повторный клик по уже выставленной оценке на этом уроке — удалить её
+            same = [r for r in self.mark_ids.get(lid, {}).get(sid, []) if r["value"] == str(g)]
+            if same:
+                self.delete("mark", [same[-1]["id"]], lid, f"{g} {name}")
+            else:
+                self.perform("mark", [sid], g, [lid], f"{g} {name}")
+            return
+        reason = self.absences.get(lid, {}).get(sid)
+        if reason == 2:
+            self.set_result(f"УП у {name} снимается только в журнале МЭШ")
+        elif reason == 1:
+            aid = self.absence_ids.get(lid, {}).get(sid)
+            if aid:
+                self.delete("absence", [aid], lid, f"Н {name}")
+            else:
+                self.set_result(f"Н {name}: обновляю данные урока, нажми ещё раз")
+                self.load_lesson(lid)
+        else:
+            self.perform("absence", [sid], None, [lid], f"Н {name}")
+
+    def perform(self, kind, sids, grade, lids, title):
+        if not self.mesh:
+            self.set_result("Нет связи с МЭШ — нажми «Обновить»", err=True)
+            return
+        mesh, v3, remote = self.mesh, self.v3, self.remote
+        for lid in (lids or [None]):
+            keys = {self.flight_key(kind, sid, lid, grade) for sid in sids}
+            if keys & self.in_flight:
+                continue   # двойной клик, запрос ещё идёт
+            self.in_flight |= keys
+            self.set_result(f"выполняю {title}…")
+
+            def fn(lid=lid):
+                return remote.act_data(v3, mesh, kind,
+                                       student_id=sids[0] if len(sids) == 1 else None,
+                                       grade=grade, schedule_lesson_id=lid,
+                                       student_ids=sids if len(sids) > 1 else None)
+
+            def ok(d, lid=lid, keys=keys):
+                self.in_flight -= keys
+                if d.get("error"):
+                    self.set_result(f"⚠ {title}: {d['error']}", err=True)
+                else:
+                    failed = len(d.get("failed") or {})
+                    self.set_result(f"✓ {title} — готово" if not failed
+                                    else f"⚠ {title} — не прошло у {failed} уч.", err=bool(failed))
+                    created = [i for i in (d.get("created") or {}).values() if i]
+                    real_lid = (d.get("lesson") or {}).get("schedule_lesson_id") or lid
+                    if created and kind != "nohomework":
+                        self.history.append({"kind": kind, "ids": created, "lesson_id": real_lid, "title": title})
+                    if kind == "absence" and real_lid:
+                        for sid in d.get("done") or sids:
+                            self.absences.setdefault(real_lid, {})[sid] = 1
+                if lid:
+                    self.load_lesson(lid)
+
+            def err(e, keys=keys):
+                self.in_flight -= keys
+                self.set_result(f"⚠ {title}: {e}", err=True)
+
+            self.run(fn, ok, err)
+        self.render()
+
+    def delete(self, kind, ids, lid, title):
+        key = f"del-{kind}-{','.join(map(str, ids))}"
+        if key in self.in_flight or not self.mesh:
+            return
+        self.in_flight.add(key)
+        self.set_result(f"удаляю {title}…")
+        mesh, remote = self.mesh, self.remote
+
+        def ok(d):
+            self.in_flight.discard(key)
+            if d.get("error"):
+                self.set_result(f"⚠ удаление {title}: {d['error']}", err=True)
+            else:
+                self.set_result(f"✕ удалено: {title}")
+                self.history = [h for h in self.history if not set(h["ids"]) & set(ids)]
+            self.load_lesson(lid)
+
+        def err(e):
+            self.in_flight.discard(key)
+            self.set_result(f"⚠ удаление {title}: {e}", err=True)
+
+        self.run(lambda: remote.delete_data(mesh, kind, ids), ok, err)
+        self.render()
+
+    def do_undo(self):
+        if not self.history:
+            self.set_result("Нечего отменять: пульт сегодня ещё ничего не ставил")
+            return
+        h = self.history.pop()
+        self.delete(h["kind"], h["ids"], h["lesson_id"], h["title"])
 
     def do_nohw(self):
-        threading.Thread(target=self._thread_nohw, daemon=True).start()
+        self.perform("nohomework", [], None, [], "без д/з (текущий урок)")
 
-    def _thread_nohw(self):
-        try:
-            m = self.mods
-            lessons = m.get_daily_schedule()
-            cur = m.find_current_lesson(lessons)
-            grp = cur.get("group_id")
-            if m.homework_absence_exists(grp, datetime.datetime.now().strftime("%d.%m.%Y")):
-                self.q.put(("result", None, "Без д/з уже стоит"))
-            else:
-                m.add_homework_absence(grp, datetime.datetime.now())
-                self.q.put(("result", None, "Без д/з ✓"))
-        except Exception as e:
-            self.q.put(("error", f"Без д/з: {e}", None))
+    def roll_start(self, key):
+        self.roll[key] = set()
+        self.render()
 
-    def fail(self, msg):
-        messagebox.showerror("Ошибка", msg)
-        self.status.config(text="Ошибка")
+    def roll_toggle(self, key, sid):
+        self.roll[key] ^= {sid}
+        self.render()
+
+    def roll_cancel(self, key):
+        self.roll.pop(key, None)
+        self.render()
+
+    def roll_submit(self, key, lids):
+        ids = sorted(self.roll.get(key) or [])
+        if not ids:
+            self.set_result("Никто не отмечен — отметь отсутствующих кликом по фамилии")
+            return
+        self.roll.pop(key, None)
+        where = f" на {len(lids)} урока" if len(lids) > 1 else ""
+        self.perform("absence", ids, None, lids, f"перекличка: {len(ids)} уч.{where}")
+
+
+# ---------- самопроверка (CI) ----------
+
+def selftest(hold_ms=0):
+    """Окно на тестовых данных: импорт модулей, отрисовка всех режимов, без сети."""
+    import mesh_automation_v3  # noqa: F401  — в сборке должны быть оба модуля и их зависимости
+    import mesh_remote  # noqa: F401
+    import requests  # noqa: F401
+    root = tk.Tk()
+    app = PultApp(root, offline=True)
+    app.lessons = [
+        {"group": "7А", "group_id": 1, "subject": "Труд", "begin": "08:30", "end": "09:15",
+         "schedule_lesson_id": 11, "is_current": False},
+        {"group": "8Б", "group_id": 2, "subject": "Труд", "begin": "09:30", "end": "10:15",
+         "schedule_lesson_id": 21, "is_current": True},
+        {"group": "8Б", "group_id": 2, "subject": "Труд", "begin": "10:30", "end": "11:15",
+         "schedule_lesson_id": 22, "is_current": False},
+    ]
+    app.students = {1: [{"id": 101, "name": "Иванов Иван"}],
+                    2: [{"id": 201, "name": "Петрова Анна"}, {"id": 202, "name": "Сидоров Пётр"},
+                        {"id": 203, "name": "Кузнецова Мария"}]}
+    app.grades = {21: {201: ["5"]}, 22: {202: ["4"]}}
+    app.mark_ids = {21: {201: [{"id": 9001, "value": "5"}]}, 22: {202: [{"id": 9002, "value": "4"}]}}
+    app.absences = {21: {203: 1}, 11: {101: 2}}
+    app.absence_ids = {21: {203: 7001}, 11: {101: 7002}}
+    keys = [k for k, _ in app.blocks()]
+    assert len(keys) == 2, keys
+    app.expanded = set(keys)
+    app.render()
+    app.roll[keys[1]] = {202}
+    app.render()
+    app.roll_cancel(keys[1])
+    app.in_flight.add(app.flight_key("mark", 202, 21, 3))
+    app.render()
+    assert "Н 1" in app.absence_summary(app.lessons[1:]) and "УП 1" in app.absence_summary(app.lessons[:1])
+    assert version_tuple("v1.2.0-cross") > version_tuple("1.1.0")
+    root.update()
+    if hold_ms:
+        root.after(hold_ms, root.destroy)
+        root.mainloop()
+    else:
+        root.destroy()
 
 
 def main():
+    if "--selftest" in sys.argv:
+        # в сборке --windowed нет консоли: итог — в файл и код выхода
+        hold = int(sys.argv[sys.argv.index("--hold") + 1]) if "--hold" in sys.argv else 0
+        log = sys.argv[sys.argv.index("--log") + 1] if "--log" in sys.argv else None
+        try:
+            selftest(hold)
+            msg, code = f"SELFTEST OK {VERSION}\n", 0
+        except Exception:
+            import traceback
+            msg, code = traceback.format_exc(), 1
+        if log:
+            open(log, "w", encoding="utf-8").write(msg)
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+        os._exit(code)
+    if "--version" in sys.argv:
+        print(VERSION)
+        return
     root = tk.Tk()
-    app = PultApp(root)
+    PultApp(root)
     root.mainloop()
 
 

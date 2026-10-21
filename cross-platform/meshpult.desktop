@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Пульт МЭШ
+Comment=Оценки, Н и «без д/з» в журнале МЭШ без браузера (неофициальная утилита)
+Exec=MeshPult
+Icon=meshpult
+Terminal=false
+Categories=Education;Office;

@@ -402,6 +402,31 @@ class MeshAutomation:
         resp.raise_for_status()
         return resp.json()
 
+    def get_attendances(self, schedule_lesson_ids) -> List[Dict]:
+        """
+        Отсутствия (Н/УП), уже выставленные на уроки (GET).
+
+        API: GET /api/ej/core/teacher/v1/attendances?schedule_lesson_ids=1,2,3
+        Записи: student_profile_id, schedule_lesson_id, absence_reason_id (1 = Н, 2 = УП).
+        Параметр именно во множественном числе: с schedule_lesson_id API отвечает 400.
+        """
+        if isinstance(schedule_lesson_ids, (int, str)):
+            schedule_lesson_ids = [schedule_lesson_ids]
+        url = f"{BASE_URL}/api/ej/core/teacher/v1/attendances"
+        resp = self.session.get(url, params={"schedule_lesson_ids": ",".join(map(str, schedule_lesson_ids))})
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_mark(self, mark_id: int) -> None:
+        """Удалить оценку. API: DELETE /api/ej/core/teacher/v1/marks/{id}"""
+        resp = self.session.delete(f"{BASE_URL}/api/ej/core/teacher/v1/marks/{mark_id}")
+        resp.raise_for_status()
+
+    def delete_attendance(self, attendance_id: int) -> None:
+        """Удалить отметку отсутствия (Н). API: DELETE /api/ej/core/teacher/v1/attendances/{id}"""
+        resp = self.session.delete(f"{BASE_URL}/api/ej/core/teacher/v1/attendances/{attendance_id}")
+        resp.raise_for_status()
+
     def add_absence(
         self,
         schedule_lesson_id: int,

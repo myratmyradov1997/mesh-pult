@@ -1,5 +1,9 @@
 name: Build Cross-Platform MeshPult
 
+# Сборка Windows (установщик + portable) и Linux (AppImage + tar.gz).
+# Каждая сборка запускается с --selftest; снимки окна — в артефактах shots-*.
+# Релиз публикуется только по тегу v* и только если все проверки прошли.
+
 on:
   push:
     tags: ["v*"]
@@ -19,48 +23,128 @@ jobs:
       - name: Install deps
         run: |
           pip install -r cross-platform/requirements.txt
-          pip install pyinstaller
-      - name: Build
+          pip install pyinstaller==6.11.1
+      - name: Version
+        shell: pwsh
         run: |
-          pyinstaller --onefile --windowed --name MeshPult-Windows `
-            --paths . `
-            --add-data "mesh_automation_v3.py;." `
-            --add-data "mesh_remote.py;." `
-            cross-platform/mesh_pult_gui.py
+          $v = python cross-platform/mesh_pult_gui.py --version
+          "MESHPULT_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build (onedir)
+        run: >
+          pyinstaller --noconfirm --onedir --windowed --name MeshPult
+          --icon cross-platform/icon.ico
+          --add-data "cross-platform/icon.png;."
+          --hidden-import browser_cookie3
+          --paths .
+          cross-platform/mesh_pult_gui.py
+      - name: Selftest
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\MeshPult\MeshPult.exe -ArgumentList '--selftest','--log','selftest.log' -Wait -PassThru
+          Get-Content selftest.log
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - name: Screenshot
+        shell: pwsh
+        run: |
+          Start-Process dist\MeshPult\MeshPult.exe -ArgumentList '--selftest','--hold','8000'
+          Start-Sleep -Seconds 5
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("shot-windows.png")
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVer=$env:MESHPULT_VERSION" cross-platform\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Silent install check
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\MeshPult-Windows-Setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit 1 }
+          $exe = "$env:LOCALAPPDATA\Programs\MeshPult\MeshPult.exe"
+          $p = Start-Process $exe -ArgumentList '--selftest','--log','installed.log' -Wait -PassThru
+          Get-Content installed.log
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - name: Portable zip
+        shell: pwsh
+        run: Compress-Archive -Path dist\MeshPult -DestinationPath dist\MeshPult-Windows-portable.zip
       - uses: actions/upload-artifact@v4
         with:
           name: MeshPult-Windows
-          path: dist/MeshPult-Windows.exe
+          path: |
+            dist/MeshPult-Windows-Setup.exe
+            dist/MeshPult-Windows-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shots-windows
+          path: shot-windows.png
 
+  # Debian 10 (glibc 2.28): чтобы сборка шла и на старых школьных дистрибутивах
+  # (Astra Linux 1.7, РЕД ОС, Альт), а не только на свежей Ubuntu.
   build-linux:
     runs-on: ubuntu-latest
+    container: python:3.11-buster
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install tk
-        run: sudo apt-get install -y python3-tk tk xvfb
       - name: Install deps
         run: |
           pip install -r cross-platform/requirements.txt
-          pip install pyinstaller
-      - name: Build
+          pip install pyinstaller==6.11.1
+      - name: Build (onedir)
         run: |
-          pyinstaller --onefile --windowed --name MeshPult-Linux \
+          pyinstaller --noconfirm --onedir --windowed --name MeshPult \
+            --add-data cross-platform/icon.png:. \
+            --hidden-import browser_cookie3 \
             --paths . \
-            --add-data mesh_automation_v3.py:. \
-            --add-data mesh_remote.py:. \
             cross-platform/mesh_pult_gui.py
-          chmod +x dist/MeshPult-Linux
-          tar -czf MeshPult-Linux.tar.gz -C dist MeshPult-Linux
+      - name: AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp -r dist/MeshPult AppDir/usr/bin/
+          cp cross-platform/AppRun AppDir/AppRun && chmod +x AppDir/AppRun
+          cp cross-platform/meshpult.desktop AppDir/meshpult.desktop
+          cp cross-platform/icon.png AppDir/meshpult.png
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir dist/MeshPult-Linux-x86_64.AppImage
+          tar -czf dist/MeshPult-Linux.tar.gz -C dist MeshPult
       - uses: actions/upload-artifact@v4
         with:
           name: MeshPult-Linux
-          path: MeshPult-Linux.tar.gz
+          path: |
+            dist/MeshPult-Linux-x86_64.AppImage
+            dist/MeshPult-Linux.tar.gz
+
+  test-linux:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MeshPult-Linux
+      - name: X server and fonts
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb imagemagick fonts-dejavu-core
+      - name: Selftest + screenshot
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          chmod +x MeshPult-Linux-x86_64.AppImage
+          xvfb-run -a -s "-screen 0 1280x900x24" ./MeshPult-Linux-x86_64.AppImage --selftest --log selftest.log
+          cat selftest.log
+          xvfb-run -a -s "-screen 0 1280x900x24" sh -c \
+            './MeshPult-Linux-x86_64.AppImage --selftest --hold 8000 & sleep 5; import -window root shot-linux.png; wait'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shots-linux
+          path: shot-linux.png
 
   release:
-    needs: [build-windows, build-linux]
+    needs: [build-windows, test-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -68,5 +152,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            MeshPult-Windows/MeshPult-Windows.exe
+            MeshPult-Windows/MeshPult-Windows-Setup.exe
+            MeshPult-Windows/MeshPult-Windows-portable.zip
+            MeshPult-Linux/MeshPult-Linux-x86_64.AppImage
             MeshPult-Linux/MeshPult-Linux.tar.gz
