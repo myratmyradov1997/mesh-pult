@@ -105,6 +105,11 @@ def read_profile():
         p = open(PROFILE_FILE).read().strip()
         if p:
             return p
+    # автоматом из Local Storage браузера (обычный кейс — найдётся)
+    auto = find_profile_id_storage()
+    if auto:
+        save_profile(auto)
+        return str(auto)
     return None
 
 
@@ -114,6 +119,54 @@ def save_profile(pid):
         os.chmod(PROFILE_FILE, 0o600)
     except Exception:
         pass
+
+
+def find_profile_id_storage():
+    """Profile-Id из Local Storage браузера (Chrome/Edge/Helium/Firefox).
+
+    school.mos.ru сам хранит profile_id в localStorage (браузерный фронт
+    отправляет его в заголовке Profile-Id), поэтому его можно вытащить
+    прямо из leveldb-файлов браузера — без ручного ввода.
+    """
+    import re
+    import shutil
+    import tempfile
+    import glob
+    rootdirs = [
+        os.environ.get("LOCALAPPDATA"),  # Windows: Chrome/Edge там
+        os.path.expanduser("~/.config"),  # Linux: chromium
+        os.path.expanduser("~/Library/Application Support"),  # macOS
+    ]
+    browsers = [
+        "Google/Chrome", "Microsoft/Edge", "Chromium", "chromium",
+        "net.imput.helium", "BraveSoftware/Brave-Browser",
+        "Yandex/YandexBrowser", "Vivaldi",
+    ]
+    found = []
+    for rootdir in rootdirs:
+        if not rootdir:
+            continue
+        for b in browsers:
+            for sub in (os.path.join(rootdir, b, "Default", "Local Storage", "leveldb"),
+                        os.path.join(rootdir, b, "Local Storage", "leveldb")):
+                if not os.path.isdir(sub):
+                    continue
+                tmp = tempfile.mkdtemp(prefix="meshpult_ls_")
+                try:
+                    for f in glob.glob(os.path.join(sub, "*.ldb")):
+                        try:
+                            dst = os.path.join(tmp, os.path.basename(f))
+                            shutil.copy(f, dst)
+                            data = open(dst, "rb").read()
+                        except Exception:
+                            continue
+                        for m in re.finditer(rb'"profile_id"\s*:\s*(\d{6,12})', data):
+                            found.append(int(m.group(1)))
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+    if not found:
+        return None
+    return max(set(found), key=found.count)  # самый частый (сквозь несколько файлов)
 
 
 def work():
