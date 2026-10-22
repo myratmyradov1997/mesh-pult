@@ -63,11 +63,12 @@ def lesson_public(l: dict) -> dict:
     end_s = l.get("time_end") or l.get("end_time")
     cur = False
     try:
-        begin = datetime.strptime(begin_s, "%H:%M")
-        end = datetime.strptime(end_s or begin_s, "%H:%M")
+        # strptime даёт 1900-01-01 — переносим время урока на сегодня, иначе now всегда позже конца
+        now = datetime.now()
+        begin = datetime.combine(now.date(), datetime.strptime(begin_s, "%H:%M").time())
+        end = datetime.combine(now.date(), datetime.strptime(end_s or begin_s, "%H:%M").time())
         if end < begin:
             end = end + timedelta(days=1)
-        now = datetime.now()
         cur = begin <= now <= end
     except Exception:
         pass
@@ -176,6 +177,59 @@ def grades_data(mesh, schedule_lesson_id=None) -> dict:
     except Exception as e:
         print(f"attendances: {e}", file=sys.stderr)
     return data
+
+
+def day_data(mesh) -> dict:
+    """Всё для панели одним процессом: расписание, срок токена, оценки и Н всех уроков дня.
+    lessons_data: schedule_lesson_id → {grades, mark_ids, absences, absence_ids}."""
+    lessons = mesh.get_daily_schedule()
+    lids = [l["schedule_lesson_id"] for l in lessons if l.get("schedule_lesson_id")]
+    per = {lid: {"grades": {}, "mark_ids": {}, "absences": {}, "absence_ids": {}} for lid in lids}
+    for lid in lids:
+        try:
+            marks = lesson_marks(mesh, lid)
+            per[lid]["grades"] = {sid: [r["value"] for r in rs] for sid, rs in marks.items()}
+            per[lid]["mark_ids"] = marks
+        except Exception as e:
+            print(f"marks {lid}: {e}", file=sys.stderr)
+    # Н/УП всех уроков дня — одним запросом
+    try:
+        for a in (mesh.get_attendances(lids) if lids else []):
+            lid, sid = a.get("schedule_lesson_id"), a.get("student_profile_id")
+            if isinstance(a, dict) and lid in per and sid:
+                per[lid]["absences"][sid] = a.get("absence_reason_id") or 1
+                per[lid]["absence_ids"][sid] = a.get("id")
+    except Exception as e:
+        print(f"attendances: {e}", file=sys.stderr)
+    return {
+        "lessons": [lesson_public(l) for l in lessons],
+        "token_expires": token_expires(mesh),
+        "lessons_data": per,
+        "sick": sick_today(mesh, lessons),
+    }
+
+
+def sick_today(mesh, lessons) -> dict:
+    """Болеющие сегодня по ЕМИАС (в журнале значок «б», Н при этом не стоит).
+    group_id → student_id → SICK | SICK_WITH_INFECTION."""
+    from datetime import date
+    day = date.today().isoformat()
+    by_unit: dict = {}   # class_unit_id → записи ЕМИАС (один класс бывает в нескольких группах)
+    sick: dict = {}
+    for gid in {l.get("group_id") for l in lessons if l.get("group_id")}:
+        try:
+            profiles = mesh.get_student_profiles(gid)
+            members = {p.get("id") for p in profiles}
+            for cu in {(p.get("class_unit") or {}).get("id") for p in profiles} - {None}:
+                if cu not in by_unit:
+                    by_unit[cu] = mesh.get_medical_recommendations(cu, day)
+                for rec in by_unit[cu]:
+                    sid = rec.get("student_profile_id")
+                    if rec.get("type") in ("SICK", "SICK_WITH_INFECTION") and sid in members:
+                        sick.setdefault(gid, {})[sid] = rec["type"]
+        except Exception as e:
+            print(f"emias {gid}: {e}", file=sys.stderr)
+    return sick
 
 
 def act_data(m, mesh, kind: str, student_id=None, grade=None, dry: bool = False,
@@ -304,7 +358,7 @@ def main() -> int:
     sys.stdout = sys.stderr
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["today", "students", "status", "act", "grades", "delete"])
+    ap.add_argument("command", choices=["today", "day", "students", "status", "act", "grades", "delete"])
     args, rest = ap.parse_known_args()
 
     try:
@@ -335,6 +389,8 @@ def main() -> int:
         m, mesh = fresh_mesh()
         if args.command == "today":
             return out(today_data(mesh))
+        if args.command == "day":
+            return out(day_data(mesh))
         if args.command == "status":
             return out(status_data(mesh))
         if args.command == "grades":

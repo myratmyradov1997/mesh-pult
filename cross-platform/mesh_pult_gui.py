@@ -23,7 +23,7 @@ import threading
 import queue
 import webbrowser
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REPO = "myratmyradov1997/mesh-pult"
 
 # PyInstaller --windowed: stdout/stderr отсутствуют, а v3 печатает логи

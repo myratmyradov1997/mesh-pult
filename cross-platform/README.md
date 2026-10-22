@@ -74,7 +74,7 @@ pyinstaller --onedir --windowed --name MeshPult \
 dist/MeshPult/MeshPult --selftest --log selftest.log   # проверка без сети
 ```
 
-Установщик Windows: `ISCC /DAppVer=1.1.0 cross-platform\installer.iss`.
+Установщик Windows: `ISCC /DAppVer=1.1.1 cross-platform\installer.iss`.
 Всё это делает GitHub Actions (`.github/workflows/build-cross.yml`): сборка,
 самопроверка собранной программы, снимки окна, релиз по тегу `v*`.
 

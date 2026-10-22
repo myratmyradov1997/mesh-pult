@@ -190,6 +190,8 @@ class MeshAutomation:
         
         # Кэш данных
         self._students_cache: Dict[int, List[Dict]] = {}
+        # control_form_id → grade_system_id: у каждой формы своя шкала, чужая → 400 при выставлении
+        self._form_grade_system: Dict[int, int] = {}
         self._schedule_cache: Dict[int, List[Dict]] = {}
         self._token_refresh_attempted = False
         self.last_error: Optional[str] = None
@@ -338,7 +340,11 @@ class MeshAutomation:
         
         response = self.session.get(url, params=params)
         response.raise_for_status()
-        return response.json()
+        forms = response.json()
+        for f in forms if isinstance(forms, list) else []:
+            if f.get("id") and f.get("grade_system_id"):
+                self._form_grade_system[f["id"]] = f["grade_system_id"]
+        return forms
 
     def add_mark(
         self,
@@ -348,12 +354,18 @@ class MeshAutomation:
         grade: int,
         control_form_id: int,
         theme_frame_integration_id: int,
-        grade_system_id: int = 4140512,
+        grade_system_id: int = None,
         comment: str = "",
         weight: int = 1
     ) -> Dict:
-        """Выставить оценку ученику."""
+        """Выставить оценку ученику.
+
+        grade_system_id по умолчанию — шкала самой формы контроля (из get_control_forms);
+        4140512 подходит только формам «Труда», у «Программирования» шкалы другие.
+        """
         url = f"{BASE_URL}/api/ej/core/teacher/v1/marks"
+        if grade_system_id is None:
+            grade_system_id = self._form_grade_system.get(control_form_id, 4140512)
         
         payload = {
             "comment": comment,
@@ -414,6 +426,21 @@ class MeshAutomation:
             schedule_lesson_ids = [schedule_lesson_ids]
         url = f"{BASE_URL}/api/ej/core/teacher/v1/attendances"
         resp = self.session.get(url, params={"schedule_lesson_ids": ",".join(map(str, schedule_lesson_ids))})
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_medical_recommendations(self, class_unit_id: int, day: str) -> List[Dict]:
+        """
+        Сведения ЕМИАС на день (значок «б» в журнале: «Этот учащийся сегодня болеет»).
+
+        API: GET /api/ej/core/teacher/v1/emias_medical_recommendations
+             ?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&class_unit_id=N
+        Записи: student_profile_id, date, type (SICK, SICK_WITH_INFECTION, EXEMPT — освобождён
+        от физ. нагрузок по subject_ids). Без class_unit_id API отвечает 400.
+        """
+        url = f"{BASE_URL}/api/ej/core/teacher/v1/emias_medical_recommendations"
+        resp = self.session.get(url, params={"start_date": day, "end_date": day,
+                                             "class_unit_id": class_unit_id, "page": 1, "per_page": 300})
         resp.raise_for_status()
         return resp.json()
 
@@ -1582,10 +1609,15 @@ def get_lesson_params(mesh: MeshAutomation, lesson: Dict) -> Tuple[Optional[int]
     print(f"   🔍 Получаю формы контроля для предмета {lesson.get('subject_id')}...")
     forms = mesh.get_control_forms(lesson['subject_id'])
     control_form_id = None
-    for form in forms:
-        if "Учебное задание" in form.get('name', ''):
-            control_form_id = form['id']
-            print(f"   ✅ Найдена форма контроля: Учебное задание (ID: {control_form_id})")
+    # «Учебное задание» есть не у всех предметов (у «Программирования» нет) —
+    # тогда классная форма, а не первая по списку («Домашняя работа»)
+    for wanted in ("Учебное задание", "Практическая работа", "Устный ответ"):
+        for form in forms:
+            if wanted in form.get('name', ''):
+                control_form_id = form['id']
+                print(f"   ✅ Найдена форма контроля: {form.get('name')} (ID: {control_form_id})")
+                break
+        if control_form_id:
             break
     if not control_form_id and forms:
         control_form_id = forms[0]['id']

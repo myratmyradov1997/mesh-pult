@@ -102,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var selectedLessonIdx: Int?
     var markIds: [Int: [Int: [MarkRef]]] = [:]      // scheduleLessonId → studentId → оценки с id
     var absenceIds: [Int: [Int: Int]] = [:]          // scheduleLessonId → studentId → id отметки Н
+    var sickCache: [Int: [Int: String]] = [:]        // groupId → studentId → болеет сегодня по ЕМИАС («б» в журнале)
     var history: [DoneAction] = []                   // что поставил пульт: «Отменить» удаляет последнее
     var inFlight: Set<String> = []                   // запросы в пути: kind-student-lesson
     var rollCall: [String: Set<Int>] = [:]           // ключ раскрытия → отмеченные отсутствующие
@@ -120,6 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             absenceCache.removeAll()
             markIds.removeAll()
             absenceIds.removeAll()
+            sickCache.removeAll()
             history.removeAll()
             expandedKeys.removeAll()
             selectedLessonIdx = nil
@@ -128,8 +130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Предзагрузка данных дня: ученики всех групп + оценки всех уроков,
-    /// чтобы при первом же открытии панели клик не ждал загрузки
+    /// Предзагрузка учеников всех групп дня, чтобы клик по уроку не ждал загрузки.
+    /// Оценки и Н всех уроков приходят при каждом refreshAll (команда моста day).
     func preloadDayData() {
         guard preloadedDay != cacheDay, !lessons.isEmpty else { return }
         preloadedDay = cacheDay
@@ -138,12 +140,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for g in groups where studentsCache[g] == nil {
             loadStudents(groupId: g, rerender: false)
         }
-        for l in lessons {
-            if let lid = l.scheduleLessonId, gradesCache[lid] == nil {
-                loadGrades(lessonId: lid)
-            }
-        }
     }
+    var refreshing = false                           // refreshAll в пути: не запускать второй
     let queue = DispatchQueue(label: "mesh-pult", qos: .utility)
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -256,8 +254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func refreshAll() {
         clearCachesIfNewDay()
         if panel?.isVisible == true { contentView.headerText(vals: lessons) }
-        bridge(["today"]) { [weak self] res in
+        guard !refreshing else { return }
+        refreshing = true
+        bridge(["day"]) { [weak self] res in
             guard let self else { return }
+            self.refreshing = false
             switch res {
             case .success(let data):
                 var list: [Lesson] = []
@@ -275,10 +276,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let i = self.selectedLessonIdx, !self.lessons.indices.contains(i) {
                     self.selectedLessonIdx = nil
                 }
+                self.tokenExp = data["token_expires"] as? String ?? self.tokenExp
+                // оценки и Н всех уроков дня — свежие при каждом обновлении
+                for (k, v) in (data["lessons_data"] as? [String: Any]) ?? [:] {
+                    if let lid = Int(k), let d = v as? [String: Any] { self.applyLessonData(lid, d) }
+                }
+                var sick: [Int: [Int: String]] = [:]
+                for (g, v) in (data["sick"] as? [String: Any]) ?? [:] {
+                    guard let gid = Int(g), let m = v as? [String: Any] else { continue }
+                    for (k, t) in m { if let sid = Int(k) { sick[gid, default: [:]][sid] = t as? String ?? "SICK" } }
+                }
+                self.sickCache = sick
+                if self.resultLine == "обновляю расписание…" {
+                    let f = DateFormatter()
+                    f.dateFormat = "HH:mm"
+                    self.resultLine = "✅ обновлено в \(f.string(from: Date()))"
+                }
                 self.contentView?.headerText(vals: list)
                 // предзагрузка: чтобы клик по любому уроку не ждал сеть
                 self.preloadDayData()
-                self.fetchStatus()
             case .failure(let e):
                 self.resultLine = "МЭШ: \(e.localizedDescription)"
                 if self.panel?.isVisible == true { self.contentView.headerText(vals: self.lessons) }
@@ -436,7 +452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func doRollStart(_ sender: TagButton) {
         guard let k = sender.payload?["expKey"] as? String else { return }
-        rollCall[k] = []
+        rollCall[k] = Set((sender.payload?["preselect"] as? [Int]) ?? [])
         rerender()
     }
 
@@ -534,37 +550,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             switch res {
             case .success(let d):
-                var g: [Int: [String]] = [:]
-                for (k, v) in (d["grades"] as? [String: Any]) ?? [:] {
-                    guard let sid = Int(k), let names = v as? [String] else { continue }
-                    g[sid] = names
-                }
-                self.gradesCache[lessonId] = g
-                var a: [Int: Int] = [:]
-                for (k, v) in (d["absences"] as? [String: Any]) ?? [:] {
-                    guard let sid = Int(k) else { continue }
-                    a[sid] = (v as? Int) ?? 1
-                }
-                self.absenceCache[lessonId] = a
-                var mi: [Int: [MarkRef]] = [:]
-                for (k, v) in (d["mark_ids"] as? [String: Any]) ?? [:] {
-                    guard let sid = Int(k), let rs = v as? [[String: Any]] else { continue }
-                    mi[sid] = rs.compactMap { r in
-                        guard let id = r["id"] as? Int, let val = r["value"] as? String else { return nil }
-                        return MarkRef(id: id, value: val)
-                    }
-                }
-                self.markIds[lessonId] = mi
-                var ai: [Int: Int] = [:]
-                for (k, v) in (d["absence_ids"] as? [String: Any]) ?? [:] {
-                    if let sid = Int(k), let id = v as? Int { ai[sid] = id }
-                }
-                self.absenceIds[lessonId] = ai
+                self.applyLessonData(lessonId, d)
                 if self.panel?.isVisible == true { self.contentView.headerText(vals: self.lessons) }
             case .failure:
                 break   // нет оценок / ошибка чтения — просто без подсветки
             }
         }
+    }
+
+    /// оценки, Н и id записей одного урока (ответ grades или элемент lessons_data из day)
+    func applyLessonData(_ lessonId: Int, _ d: [String: Any]) {
+        var g: [Int: [String]] = [:]
+        for (k, v) in (d["grades"] as? [String: Any]) ?? [:] {
+            guard let sid = Int(k), let names = v as? [String] else { continue }
+            g[sid] = names
+        }
+        self.gradesCache[lessonId] = g
+        var a: [Int: Int] = [:]
+        for (k, v) in (d["absences"] as? [String: Any]) ?? [:] {
+            guard let sid = Int(k) else { continue }
+            a[sid] = (v as? Int) ?? 1
+        }
+        self.absenceCache[lessonId] = a
+        var mi: [Int: [MarkRef]] = [:]
+        for (k, v) in (d["mark_ids"] as? [String: Any]) ?? [:] {
+            guard let sid = Int(k), let rs = v as? [[String: Any]] else { continue }
+            mi[sid] = rs.compactMap { r in
+                guard let id = r["id"] as? Int, let val = r["value"] as? String else { return nil }
+                return MarkRef(id: id, value: val)
+            }
+        }
+        self.markIds[lessonId] = mi
+        var ai: [Int: Int] = [:]
+        for (k, v) in (d["absence_ids"] as? [String: Any]) ?? [:] {
+            if let sid = Int(k), let id = v as? Int { ai[sid] = id }
+        }
+        self.absenceIds[lessonId] = ai
     }
 
     func loadStudents(groupId: Int) {
@@ -880,7 +901,7 @@ final class PanelView: NSView {
                 let key = "blk\(i)-\(count)-\(l.groupId)"
                 let time = [block.first!.begin, block.last!.end].compactMap({$0}).joined(separator: "–")
                 let dot = block.contains { $0.isCurrent } ? "🟢" : "⚪️"
-                let hdr = blockButton("\(dot) \(time)  \(l.subject) · \(l.group) · \(count) урока\(absenceSummary(block))",
+                let hdr = blockButton("\(dot) \(time)  \(lessonTitle(l)) · \(count) урока\(absenceSummary(block))",
                                       key: key, width: cfg.panelWidth - 28)
                 documentStack.addArrangedSubview(hdr)
                 if app.expandedKeys.contains(key) {
@@ -892,7 +913,7 @@ final class PanelView: NSView {
             } else {
                 let t = [l.begin, l.end].compactMap { $0 }.joined(separator: "–")
                 let dot = l.isCurrent ? "🟢" : "⚪️"
-                let row = rowButton("\(dot) \(t)  \(l.subject) · \(l.group)\(absenceSummary([l]))",
+                let row = rowButton("\(dot) \(t)  \(lessonTitle(l))\(absenceSummary([l]))",
                                     action: #selector(AppDelegate.pickLesson(_:)),
                                     index: i, width: cfg.panelWidth - 28)
                 documentStack.addArrangedSubview(row)
@@ -941,7 +962,14 @@ final class PanelView: NSView {
         documentStack.addArrangedSubview(wrap)
     }
 
-    /// « · Н 2 · УП 5» для строки урока/блока: ученик считается один раз на блок
+    /// «Программирование 7А 2 гр» вместо «Программирование · Программирование 7А 2 гр»:
+    /// группа в МЭШ обычно уже названа по предмету — так счётчик Н не уходит за край строки
+    private func lessonTitle(_ l: Lesson) -> String {
+        let word = l.subject.split(whereSeparator: { !$0.isLetter }).first.map(String.init) ?? l.subject
+        return l.group.localizedCaseInsensitiveContains(word) ? l.group : "\(l.subject) · \(l.group)"
+    }
+
+    /// « · Н 2 · УП 5 · Б 1» для строки урока/блока: ученик считается один раз на блок
     private func absenceSummary(_ block: [Lesson]) -> String {
         var reasons: [Int: Int] = [:]
         for l in block {
@@ -950,7 +978,9 @@ final class PanelView: NSView {
         }
         let up = reasons.values.filter { $0 == 2 }.count
         let n = reasons.count - up
-        return (n > 0 ? " · Н \(n)" : "") + (up > 0 ? " · УП \(up)" : "")
+        // болеют по ЕМИАС, но Н ещё не поставлена
+        let sick = block.first.flatMap { app?.sickCache[$0.groupId] }?.keys.filter { reasons[$0] == nil }.count ?? 0
+        return (n > 0 ? " · Н \(n)" : "") + (up > 0 ? " · УП \(up)" : "") + (sick > 0 ? " · Б \(sick)" : "")
     }
 
     private func i_of(_ block: [Lesson], _ l: Lesson) -> Int {
@@ -969,8 +999,11 @@ final class PanelView: NSView {
                 renderRollCall(into: wrap, students: st, block: block, activeIdx: activeIdx,
                                expKey: expKey, marked: marked)
             } else {
+                // болеющие по ЕМИАС, у кого ещё нет Н, — сразу отмечены в перекличке
+                let absent = Set(block.compactMap { $0.scheduleLessonId }.flatMap { (app.absenceCache[$0] ?? [:]).keys })
+                let preselect = (app.sickCache[groupId] ?? [:]).keys.filter { !absent.contains($0) }
                 let start = smallButton("📋 Перекличка", action: #selector(AppDelegate.doRollStart(_:)),
-                                        payload: ["expKey": expKey])
+                                        payload: ["expKey": expKey, "preselect": Array(preselect)])
                 wrap.addArrangedSubview(indented([start]))
                 renderStudents(into: wrap, students: st, block: block, activeIdx: activeIdx, blockKey: blockKey)
             }
@@ -1076,9 +1109,11 @@ final class PanelView: NSView {
             // отсутствующий (Н/УП) на активном уроке, иначе на любом уроке блока — приглушить имя
             let reason = activeLesson.scheduleLessonId.flatMap { app?.absenceCache[$0]?[id] }
                 ?? block.lazy.compactMap { $0.scheduleLessonId.flatMap { app?.absenceCache[$0]?[id] } }.first
-            let nameText = reason == nil ? name : "\(reason == 2 ? "УП" : "Н") · \(name)"
+            // болеет по ЕМИАС («б» в журнале), Н ещё нет — тоже приглушить
+            let sick = reason == nil && app?.sickCache[activeLesson.groupId]?[id] != nil
+            let nameText = reason != nil ? "\(reason == 2 ? "УП" : "Н") · \(name)" : sick ? "Б · \(name)" : name
             let nameL = label(nameText, size: 12, bold: false,
-                              color: reason == nil ? NSColor.white : NSColor.white.withAlphaComponent(0.4))
+                              color: reason == nil && !sick ? NSColor.white : NSColor.white.withAlphaComponent(0.4))
             nameL.widthAnchor.constraint(equalToConstant: 170).isActive = true
             nameL.lineBreakMode = .byTruncatingTail
             row.addArrangedSubview(nameL)
